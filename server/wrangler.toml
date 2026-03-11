@@ -1,0 +1,12 @@
+name = "qsend-signal"
+main = "cloudflare.worker.js"
+compatibility_date = "2024-01-01"
+account_id = "98bf01ef2e3d7ebba00123411e218e06"
+
+[[durable_objects.bindings]]
+name = "SESSIONS"
+class_name = "SessionStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionStore"]

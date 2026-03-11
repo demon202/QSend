@@ -1,0 +1,17 @@
+{
+  "name": "qsend-signal",
+  "version": "1.0.0",
+  "description": "QSend WebRTC signaling server — stateless, no storage",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}
