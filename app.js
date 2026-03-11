@@ -26,12 +26,23 @@ const CONFIG = Object.freeze({
   CHUNK_SIZE:    256 * 1024,       // 256 KB per chunk
   MAX_BUFFER:    4  * 1024 * 1024, // Pause at 4 MB buffered
   RESUME_BUFFER: 512 * 1024,       // Resume when buffer < 512 KB
+ICE_SERVERS: [
+  { urls: 'stun:stun.l.google.com:19302' },
 
-  ICE_SERVERS: [
-    { urls: 'stun:stun.l.google.com:19302'  },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ],
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp'
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  },
+
+  {
+    urls: 'stun:global.stun.twilio.com:3478'
+  }
+]
 });
 
 // ══════════════════════════════════════════════════════════════
