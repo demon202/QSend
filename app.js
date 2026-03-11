@@ -251,6 +251,7 @@ const state = {
   ws:          null,   // WebSocket (signaling)
   pc:          null,   // RTCPeerConnection
   dc:          null,   // RTCDataChannel
+  pendingICE: [], //iceChannels
 
   keyPair:     null,   // ECDH key pair
   sharedKey:   null,   // AES-256-GCM derived key
@@ -279,6 +280,8 @@ const state = {
   // Flags
   keyReady:    false,
   xferDone:    false,
+
+  
 
   reset() {
     try { this.ws?.close();   } catch {}
@@ -321,7 +324,10 @@ function esc(str) {
 // ══════════════════════════════════════════════════════════════
 
 function createPeerConnection() {
-  const pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS });
+const pc = new RTCPeerConnection({
+  iceServers: CONFIG.ICE_SERVERS,
+  iceCandidatePoolSize: 10
+});
 
   pc.onicecandidate = ({ candidate }) => {
     if (candidate && state.ws?.readyState === WebSocket.OPEN) {
@@ -368,6 +374,7 @@ async function detectConnType(pc) {
 
 function setupDataChannel(dc) {
   dc.binaryType = 'arraybuffer';
+  dc.bufferedAmountLowThreshold = CONFIG.RESUME_BUFFER;
 
   dc.onopen = async () => {
     UI.status('Channel open — performing key exchange…', 'info');
@@ -644,6 +651,12 @@ function connectSignaling(code) {
         // ── WebRTC negotiation (sender creates offer) ──────────
         case 'offer': {
           state.pc = createPeerConnection();
+          for (const cand of state.pendingICE) {
+            try {
+                await state.pc.addIceCandidate(new RTCIceCandidate(cand));
+            } catch {}
+            }
+            state.pendingICE = [];
           state.pc.ondatachannel = ({ channel }) => {
             state.dc = channel;
             setupDataChannel(channel);
@@ -659,11 +672,17 @@ function connectSignaling(code) {
           await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           break;
 
-        case 'ice':
-          if (state.pc && msg.candidate) {
-            try { await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch {}
-          }
-          break;
+            case 'ice':
+                if (msg.candidate) {
+                if (state.pc) {
+                try {
+                    await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                } catch {}
+                } else {
+                state.pendingICE.push(msg.candidate);
+                }
+            }
+            break;
 
         case 'error':
           UI.status(`Error: ${msg.message}`, 'error');
@@ -838,6 +857,12 @@ async function initSend() {
   await connectSignaling();
 
   state.pc = createPeerConnection();
+  for (const cand of state.pendingICE) {
+  try {
+    await state.pc.addIceCandidate(new RTCIceCandidate(cand));
+  } catch {}
+}
+state.pendingICE = [];
   state.dc = state.pc.createDataChannel('qsend', { ordered: true });
   setupDataChannel(state.dc);
 
