@@ -1,0 +1,54 @@
+# fly.toml — QSend Signaling Server deployment on Fly.io
+# Deploy with: fly launch --config fly.toml
+
+app    = "qsend-signal"   # ← change to your unique app name
+primary_region = "iad"    # Washington DC — change to nearest region
+
+[build]
+  # No Dockerfile needed; using Fly's built-in Node.js buildpack
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+
+[processes]
+  app = "node index.js"
+
+[[services]]
+  internal_port = 8080
+  protocol      = "tcp"
+
+  [[services.ports]]
+    port     = 80
+    handlers = ["http"]
+    force_https = true   # Redirect HTTP → HTTPS
+
+  [[services.ports]]
+    port     = 443
+    handlers = ["tls", "http"]  # TLS termination → ws:// upgraded to wss://
+
+  [services.concurrency]
+    type       = "connections"
+    hard_limit = 1000
+    soft_limit = 800
+
+  [[services.tcp_checks]]
+    interval    = "15s"
+    timeout     = "2s"
+    grace_period = "5s"
+
+  [[services.http_checks]]
+    interval    = "30s"
+    timeout     = "5s"
+    grace_period = "5s"
+    method      = "GET"
+    path        = "/health"
+
+[deploy]
+  strategy = "rolling"   # Zero-downtime deploys
+
+# Minimal resources — signaling server is lightweight
+[[vm]]
+  cpu_kind = "shared"
+  cpus     = 1
+  memory_mb = 256

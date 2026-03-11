@@ -1,0 +1,66 @@
+{
+  "name": "QSend — Secure P2P Transfer",
+  "short_name": "QSend",
+  "description": "Encrypted peer-to-peer file transfer. Files go directly between browsers.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#060c18",
+  "theme_color": "#060c18",
+  "orientation": "any",
+  "lang": "en",
+  "categories": ["utilities", "productivity"],
+
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='32' fill='%23060c18'/%3E%3Crect x='8' y='8' width='176' height='176' rx='28' fill='none' stroke='%2300e5ff' stroke-width='4'/%3E%3Ctext x='96' y='130' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='110' fill='%2300e5ff'%3EQ%3C/text%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='80' fill='%23060c18'/%3E%3Crect x='12' y='12' width='488' height='488' rx='70' fill='none' stroke='%2300e5ff' stroke-width='10'/%3E%3Ctext x='256' y='350' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='300' fill='%2300e5ff'%3EQ%3C/text%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+
+  "shortcuts": [
+    {
+      "name": "Send a File",
+      "short_name": "Send",
+      "description": "Open QSend to send a file",
+      "url": "./?mode=send",
+      "icons": [{ "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Ctext y='80' font-size='80'%3E⬆%3C/text%3E%3C/svg%3E", "sizes": "96x96" }]
+    },
+    {
+      "name": "Receive a File",
+      "short_name": "Receive",
+      "description": "Open QSend to receive a file",
+      "url": "./?mode=receive",
+      "icons": [{ "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'%3E%3Ctext y='80' font-size='80'%3E⬇%3C/text%3E%3C/svg%3E", "sizes": "96x96" }]
+    }
+  ],
+
+  "share_target": {
+    "action": "./?share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text":  "text",
+      "url":   "url",
+      "files": [
+        {
+          "name":   "files",
+          "accept": ["*/*"]
+        }
+      ]
+    }
+  },
+
+  "protocol_handlers": [],
+
+  "related_applications": [],
+  "prefer_related_applications": false
+}
