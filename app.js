@@ -26,9 +26,12 @@ const CONFIG = Object.freeze({
     return local ? 'ws://localhost:8080' : 'wss://qsend-signal.qsend-test.workers.dev';
   })(),
 
-  CHUNK_SIZE:    256 * 1024,
+  // 64 KB plaintext → 65,568 bytes encrypted (well under Chrome's 256 KB DataChannel limit).
+  // 256 KB plaintext + 32 bytes overhead = 262,176 bytes which EXCEEDS the 262,144-byte limit
+  // causing dc.send() to throw a silent TypeError and freezing the transfer at 0%.
+  CHUNK_SIZE:    64  * 1024,
   MAX_BUFFER:    4   * 1024 * 1024,
-  RESUME_BUFFER: 512 * 1024,
+  RESUME_BUFFER: 256 * 1024,
 
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -353,7 +356,18 @@ async function startTransfer() {
     const start = i * CONFIG.CHUNK_SIZE;
     const plain = new Uint8Array(await file.slice(start, Math.min(start + CONFIG.CHUNK_SIZE, file.size)).arrayBuffer());
     state.fileHasher.update(plain);
-    state.dc.send(await Crypto.encryptChunk(state.sharedKey, i, plain));
+
+    const encrypted = await Crypto.encryptChunk(state.sharedKey, i, plain);
+    try {
+      state.dc.send(encrypted);
+    } catch (e) {
+      // Surfaces the real error. Most common cause: encrypted chunk size exceeds the
+      // browser's DataChannel max message size (Chrome hard limit = 262,144 bytes).
+      console.error('[SEND] dc.send failed on chunk', i, 'size:', encrypted.byteLength, e);
+      UI.status(`Send error chunk ${i} (${encrypted.byteLength}B): ${e.message}`, 'error');
+      return;
+    }
+
     state.sentChunks++; state.bytesDone += plain.length;
     updateSpeed(plain.length);
     UI.setSendProgress(state.sentChunks / totalChunks, state.currentSpeed);
@@ -430,6 +444,7 @@ function connectSignaling(joinCode) {
       console.log('[WS] Connected to signaling server');
 
       if (state.mode === 'send') {
+        // ── THE KEY FIX ─────────────────────────────────────────
         // Create the peer connection and data channel NOW, while
         // we're still inside ws.onopen. The WebSocket message
         // hasn't been sent yet, so there is zero chance of

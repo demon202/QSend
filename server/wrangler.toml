@@ -1,12 +1,16 @@
 name = "qsend-signal"
 main = "cloudflare.worker.js"
 compatibility_date = "2024-01-01"
-account_id = "98bf01ef2e3d7ebba00123411e218e06"
 
+
+# Durable Objects binding — gives the Worker access to SessionStore
 [[durable_objects.bindings]]
 name = "SESSIONS"
 class_name = "SessionStore"
 
+# Migrations — required to create the Durable Object class
+# Use new_classes (not new_sqlite_classes) unless you need SQLite storage.
+# QSend stores everything in-memory so new_classes is correct.
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["SessionStore"]
+new_classes = ["SessionStore"]
