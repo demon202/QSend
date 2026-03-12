@@ -225,11 +225,14 @@ export class SessionStore {
 
         session.receiverTag = tag;
         this.socketMeta.set(tag, { code, role: 'receiver' });
+        session.receiver = ws;
+        clearTimeout(session.timer);
 
         // Notify both sides
         this._sendToTag(tag,               { type: 'joined'      });
         this._sendToTag(session.senderTag, { type: 'peer-joined' });
         break;
+        
       }
 
       // ── WebRTC offer (sender → receiver) ─────────────────────────

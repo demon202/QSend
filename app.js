@@ -152,6 +152,7 @@ const Crypto = {
 
 const state = {
   mode:null, ws:null, pc:null, dc:null, pendingICE:[],
+  remoteDescriptionSet: false,
   keyPair:null, sharedKey:null, sessionCode:null,
   file:null, fileHasher:null, totalChunks:0, sentChunks:0, paused:false,
   fileMeta:null, chunks:[], rcvdChunks:0,
@@ -493,25 +494,31 @@ function connectSignaling(joinCode) {
         case 'answer':
           console.log('[SEND] answer ←');
           await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          for (const c of state.pendingICE) {
-            try { await state.pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+          state.remoteDescriptionSet = true;
+          for (const cand of state.pendingICE) {
+            try { await state.pc.addIceCandidate(cand); } catch {}
           }
-          state.pendingICE = [];
-          break;
 
-        case 'ice':
-          if (msg.candidate) {
-            if (state.pc && state.pc.remoteDescription) {
-              try {
-                await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                console.log('[ICE] Applied:', msg.candidate.type);
-              } catch(e) { console.warn('[ICE] Failed:', e.message); }
-            } else {
-              console.log('[ICE] Buffered');
-              state.pendingICE.push(msg.candidate);
-            }
-          }
-          break;
+          state.pendingICE = [];
+                    break;
+
+case 'ice':
+  
+  if (!msg.candidate) break;
+
+  const candidate = new RTCIceCandidate(msg.candidate);
+
+  if (state.pc && state.remoteDescriptionSet) {
+    try {
+      await state.pc.addIceCandidate(candidate);
+      console.log('[ICE] Applied');
+    } catch (e) {
+      console.warn('[ICE] Failed', e);
+    }
+  } else {
+    state.pendingICE.push(candidate);
+  }
+  break;
 
         case 'error':
           console.error('[WS] Error:', msg.message);
