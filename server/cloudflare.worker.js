@@ -1,51 +1,35 @@
 /**
  * QSend Signaling Server — Cloudflare Workers + Durable Objects
  *
- * WHY THE PREVIOUS VERSION FAILED:
+ * ROOT CAUSE OF "Session not found or expired" ON FIRST TRANSFER:
  *
- * Bug 1 (fatal): ws._meta = {} does nothing in CF Workers.
- *   Durable Object WebSocket objects are opaque handles — you cannot
- *   attach arbitrary properties to them. Every lookup of ws._meta
- *   returned undefined, so relay(peer, msg) always sent to undefined.
- *   Offer, answer, and ICE messages were silently dropped every time.
+ *   Durable Objects using the WebSocket Hibernation API (acceptWebSocket)
+ *   are evicted from memory between messages to save resources. When the
+ *   DO wakes up, the constructor runs again and this.sessions = new Map()
+ *   is EMPTY — the session the sender just created is gone.
  *
- * Bug 2 (fatal): setTimeout is not available in Durable Objects
- *   when using the WebSocket Hibernation API. Using alarm() instead.
+ * FIX:
+ *   Store all session data in this.state.storage (persistent KV),
+ *   not in in-memory Maps. Storage survives hibernation indefinitely.
  *
- * Bug 3: ws.readyState comparison used Node.js ws library constants.
- *   CF Workers WebSocket uses different ready state values.
+ *   socketMeta (tag → {code, role}) is ALSO stored in persistent storage
+ *   because the socket's tag is our only link back to its session when
+ *   the DO wakes up from hibernation.
  *
- * THE FIX:
- *   Use acceptWebSocket(ws, [tag]) to attach string tags to each socket.
- *   Use getWebSockets(tag) to look them up later.
- *   Store per-socket metadata in a plain Map keyed by a socket identity
- *   string, not as properties on the socket object itself.
- *
- * Deploy:
- *   wrangler deploy
- *
- * wrangler.toml:
- *   name = "qsend-signal"
- *   main = "cloudflare-worker.js"
- *   compatibility_date = "2024-01-01"
- *
- *   [[durable_objects.bindings]]
- *   name = "SESSIONS"
- *   class_name = "SessionStore"
- *
- *   [[migrations]]
- *   tag = "v1"
- *   new_sqlite_classes = ["SessionStore"]
+ * TAG SCHEME:
+ *   Each WebSocket gets a unique tag: `ws-{timestamp}-{random}`
+ *   Storage keys:
+ *     session:{code}  → { senderTag, receiverTag|null, expiresAt }
+ *     meta:{tag}      → { code, role: 'sender'|'receiver' }
  */
 
-const SESSION_TTL_SEC = 5 * 60; // 5 minutes, used with DO alarm
+const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── Main Worker ───────────────────────────────────────────────────
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -55,18 +39,12 @@ export default {
       });
     }
 
-    // Health check
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({ ok: true }), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-        },
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
-    // All WebSocket connections go to the single global Durable Object.
-    // A single DO instance handles all sessions in memory — no DB needed.
     if (request.headers.get('Upgrade') === 'websocket') {
       const id   = env.SESSIONS.idFromName('global');
       const stub = env.SESSIONS.get(id);
@@ -83,15 +61,8 @@ export default {
 export class SessionStore {
   constructor(state, env) {
     this.state = state;
-
-    // sessions: Map<code:string, { senderTag:string, receiverTag:string|null, expiresAt:number }>
-    this.sessions = new Map();
-
-    // socketMeta: Map<tag:string, { code:string, role:'sender'|'receiver' }>
-    // This replaces ws._meta — we store metadata by tag, not on the socket object.
-    this.socketMeta = new Map();
-
-    this.nextTag = 0;
+    // NO in-memory Maps — everything goes to this.state.storage
+    // so it survives DO hibernation.
   }
 
   // ── Accept incoming WebSocket connection ─────────────────────────
@@ -99,77 +70,46 @@ export class SessionStore {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // Give this socket a unique string tag so we can find it later.
-    // acceptWebSocket registers it with the Hibernation API.
-    const tag = `sock-${this.nextTag++}`;
+    const tag = `ws-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.state.acceptWebSocket(server, [tag]);
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────
+  // ── Storage helpers ───────────────────────────────────────────────
 
-  // Get the unique tag for a WebSocket (first tag in the array)
   _tag(ws) {
-    const tags = this.state.getTags(ws);
-    return tags?.[0] ?? null;
+    return this.state.getTags(ws)?.[0] ?? null;
   }
 
-  // Send JSON to a specific socket by tag
-  _sendToTag(tag, obj) {
+  async _send(tag, obj) {
     if (!tag) return;
-    const sockets = this.state.getWebSockets(tag);
-    for (const ws of sockets) {
+    for (const ws of this.state.getWebSockets(tag)) {
       try { ws.send(JSON.stringify(obj)); } catch {}
     }
   }
 
-  // Relay a message to the peer of the current socket
-  _relay(currentTag, msg) {
-    const meta = this.socketMeta.get(currentTag);
-    if (!meta) return;
-    const session = this.sessions.get(meta.code);
-    if (!session) return;
-    const peerTag = meta.role === 'sender' ? session.receiverTag : session.senderTag;
-    this._sendToTag(peerTag, msg);
-  }
+  async _getSession(code)        { return (await this.state.storage.get(`session:${code}`)) ?? null; }
+  async _setSession(code, val)   { await this.state.storage.put(`session:${code}`, val); }
+  async _delSession(code)        { await this.state.storage.delete(`session:${code}`); }
 
-  _genCode() {
-    let code;
-    do {
-      code = String(Math.floor(100000 + Math.random() * 900000));
-    } while (this.sessions.has(code));
-    return code;
-  }
+  async _getMeta(tag)            { return (await this.state.storage.get(`meta:${tag}`)) ?? null; }
+  async _setMeta(tag, val)       { await this.state.storage.put(`meta:${tag}`, val); }
+  async _delMeta(tag)            { await this.state.storage.delete(`meta:${tag}`); }
 
-  _expireSession(code) {
-    const session = this.sessions.get(code);
+  async _expireSession(code) {
+    const session = await this._getSession(code);
     if (!session) return;
 
-    const expiredMsg = { type: 'session-expired' };
-    this._sendToTag(session.senderTag,   expiredMsg);
-    this._sendToTag(session.receiverTag, expiredMsg);
+    await this._send(session.senderTag,   { type: 'session-expired' });
+    await this._send(session.receiverTag, { type: 'session-expired' });
 
-    // Clean up socket metadata
-    if (session.senderTag)   this.socketMeta.delete(session.senderTag);
-    if (session.receiverTag) this.socketMeta.delete(session.receiverTag);
-
-    this.sessions.delete(code);
+    if (session.senderTag)   await this._delMeta(session.senderTag);
+    if (session.receiverTag) await this._delMeta(session.receiverTag);
+    await this._delSession(code);
   }
 
-  // Purge all sessions that have passed their TTL
-  _purgeExpired() {
-    const now = Date.now();
-    for (const [code, session] of this.sessions) {
-      if (session.expiresAt <= now) {
-        this._expireSession(code);
-      }
-    }
-  }
-
-  // ── Hibernation API handlers ──────────────────────────────────────
-  // These are called by the CF runtime when a socket receives a message,
-  // closes, or errors. The `ws` parameter is the server-side socket.
+  // ── Hibernation API ───────────────────────────────────────────────
 
   async webSocketMessage(ws, raw) {
     let msg;
@@ -178,102 +118,105 @@ export class SessionStore {
     const tag = this._tag(ws);
     if (!tag) return;
 
-    this._purgeExpired();
-
     switch (msg.type) {
 
-      // ── Sender: create a new session ─────────────────────────────
       case 'create': {
-        // Don't allow a socket to create multiple sessions
-        if (this.socketMeta.has(tag)) {
-          this._sendToTag(tag, { type: 'error', message: 'Already in session' });
+        if (await this._getMeta(tag)) {
+          await this._send(tag, { type: 'error', message: 'Already in session' });
           return;
         }
 
-        const code = this._genCode();
-        this.sessions.set(code, {
+        // Generate unique code
+        let code, attempts = 0;
+        do {
+          code = String(Math.floor(100000 + Math.random() * 900000));
+          attempts++;
+        } while ((await this._getSession(code)) && attempts < 20);
+
+        await this._setSession(code, {
           senderTag:   tag,
           receiverTag: null,
-          expiresAt:   Date.now() + SESSION_TTL_SEC * 1000,
+          expiresAt:   Date.now() + SESSION_TTL_MS,
         });
-        this.socketMeta.set(tag, { code, role: 'sender' });
-        this._sendToTag(tag, { type: 'created', code });
+        await this._setMeta(tag, { code, role: 'sender' });
+        await this._send(tag, { type: 'created', code });
         break;
       }
 
-      // ── Receiver: join an existing session ────────────────────────
       case 'join': {
         const code = String(msg.code || '').trim();
         if (!/^\d{6}$/.test(code)) {
-          this._sendToTag(tag, { type: 'error', message: 'Invalid code format' });
+          await this._send(tag, { type: 'error', message: 'Invalid code format' });
           return;
         }
-        if (this.socketMeta.has(tag)) {
-          this._sendToTag(tag, { type: 'error', message: 'Already in session' });
+        if (await this._getMeta(tag)) {
+          await this._send(tag, { type: 'error', message: 'Already in session' });
           return;
         }
 
-        const session = this.sessions.get(code);
+        const session = await this._getSession(code);
         if (!session) {
-          this._sendToTag(tag, { type: 'error', message: 'Session not found or expired' });
+          await this._send(tag, { type: 'error', message: 'Session not found or expired' });
+          return;
+        }
+        if (Date.now() > session.expiresAt) {
+          await this._expireSession(code);
+          await this._send(tag, { type: 'error', message: 'Session not found or expired' });
           return;
         }
         if (session.receiverTag !== null) {
-          this._sendToTag(tag, { type: 'error', message: 'Session already has a receiver' });
+          await this._send(tag, { type: 'error', message: 'Session already has a receiver' });
           return;
         }
 
         session.receiverTag = tag;
-        this.socketMeta.set(tag, { code, role: 'receiver' });
-        session.receiver = ws;
-        clearTimeout(session.timer);
+        await this._setSession(code, session);
+        await this._setMeta(tag, { code, role: 'receiver' });
 
-        // Notify both sides
-        this._sendToTag(tag,               { type: 'joined'      });
-        this._sendToTag(session.senderTag, { type: 'peer-joined' });
+        await this._send(tag,               { type: 'joined'      });
+        await this._send(session.senderTag, { type: 'peer-joined' });
         break;
-        
       }
 
-      // ── WebRTC offer (sender → receiver) ─────────────────────────
       case 'offer':
       case 'answer':
       case 'ice': {
-        // Relay verbatim to the peer — never inspect SDP or ICE content
-        this._relay(tag, msg);
+        const meta = await this._getMeta(tag);
+        if (!meta) return;
+        const session = await this._getSession(meta.code);
+        if (!session) return;
+        const peerTag = meta.role === 'sender' ? session.receiverTag : session.senderTag;
+        await this._send(peerTag, msg);
         break;
       }
 
-      // ── Explicit teardown ─────────────────────────────────────────
       case 'done': {
-        const meta = this.socketMeta.get(tag);
-        if (meta) this._expireSession(meta.code);
+        const meta = await this._getMeta(tag);
+        if (meta) await this._expireSession(meta.code);
         break;
       }
 
       default:
-        this._sendToTag(tag, { type: 'error', message: 'Unknown message type' });
+        await this._send(tag, { type: 'error', message: 'Unknown message type' });
     }
   }
 
   async webSocketClose(ws) {
     const tag = this._tag(ws);
     if (!tag) return;
+    const meta = await this._getMeta(tag);
+    if (!meta) return;
 
-    const meta = this.socketMeta.get(tag);
-    if (meta) {
-      const session = this.sessions.get(meta.code);
-      if (session) {
-        // Notify the surviving peer
-        const peerTag = meta.role === 'sender' ? session.receiverTag : session.senderTag;
-        this._sendToTag(peerTag, { type: 'peer-disconnected' });
-        this._expireSession(meta.code);
-      }
+    const session = await this._getSession(meta.code);
+    if (session) {
+      const peerTag = meta.role === 'sender' ? session.receiverTag : session.senderTag;
+      await this._send(peerTag, { type: 'peer-disconnected' });
+      await this._expireSession(meta.code);
     }
-    this.socketMeta.delete(tag);
+    await this._delMeta(tag);
   }
 
-  async webSocketError(ws, error) {
+  async webSocketError(ws) {
     await this.webSocketClose(ws);
   }
 }

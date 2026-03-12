@@ -1,29 +1,18 @@
 /**
- * QSend — Secure Peer-to-Peer File Transfer
- * app.js
+ * QSend — Secure Peer-to-Peer File Transfer  app.js
  *
- * THREE FIXES applied vs the version in the documents:
- *
- * FIX 1 — CHUNK SIZE (index.html fix too)
- *   CHUNK_SIZE was 256*1024. After AES-GCM overhead (4+12+16=32 bytes),
- *   encrypted size = 262,176 bytes which exceeds Chrome's hard DataChannel
- *   limit of 262,144 bytes. dc.send() threw TypeError silently → stuck at 0%.
- *   Fix: CHUNK_SIZE = 16*1024 (16 KB). Encrypted = 16,416 bytes. Safe on all browsers.
- *
- * FIX 2 — ICE SERVERS
- *   3 STUN + 3 TURN URLs = 6 entries. Chrome warns at ≥5 and slows gathering.
- *   The openrelay TURN server was also causing "ICE failed, TURN server broken".
- *   Fix: 1 STUN only. For most users on the same network or without strict NAT,
- *   direct P2P works fine. If you need TURN, use a reliable paid provider.
- *
- * FIX 3 — NULL ICE CANDIDATE
- *   Some browsers fire onicecandidate with candidate.candidate === "" (empty string)
- *   as an end-of-candidates sentinel. This passed the `if (candidate)` check and
- *   was relayed to the peer, printing "[ICE] Sending candidate: null null".
- *   Fix: guard with candidate.candidate !== ''
+ * Cumulative fixes applied in this version:
+ *  1. CHUNK_SIZE = 16 KB  (256 KB + 32-byte GCM overhead exceeds Chrome's 262,144-byte limit)
+ *  2. Only 1 STUN server  (≥5 triggers Chrome slowdown warning; broken TURN removed)
+ *  3. Null ICE filter     (candidate.candidate === "" sentinel was being relayed)
+ *  4. Answer guard        (duplicate answer from Safari/CF replay caused InvalidStateError)
+ *  5. Clean setupDataChannel  (removed accidental `channel.onmessage` / `handleMessage` reference)
+ *  6. No duplicate state fields  (pendingICE was declared twice)
  */
 
 'use strict';
+
+// ─── CONFIG ───────────────────────────────────────────────────────
 
 const CONFIG = Object.freeze({
   SIGNAL_URL: (() => {
@@ -31,16 +20,12 @@ const CONFIG = Object.freeze({
     return local ? 'ws://localhost:8080' : 'wss://qsend-signal.qsend-test.workers.dev';
   })(),
 
-  // FIX 1: 16 KB chunks → 16,416 bytes encrypted. Well under every browser's limit.
-  CHUNK_SIZE:    16 * 1024,
-  MAX_BUFFER:    4  * 1024 * 1024,
-  RESUME_BUFFER: 256 * 1024,
+  CHUNK_SIZE:    16  * 1024,   // 16 KB plaintext → 16,416 bytes encrypted (safe on all browsers)
+  MAX_BUFFER:    1   * 1024 * 1024,
+  RESUME_BUFFER: 128 * 1024,
 
-  // FIX 2: Single STUN server. openrelay TURN was broken per console ("TURN server broken").
-  // Add a reliable TURN here if you need to support symmetric NAT / strict firewalls.
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
   ],
 });
 
@@ -151,7 +136,8 @@ const Crypto = {
 // ─── STATE ────────────────────────────────────────────────────────
 
 const state = {
-  mode:null, ws:null, pc:null, dc:null, pendingICE:[],
+  mode:null, ws:null, pc:null, dc:null,
+  pendingICE:[],                    // single declaration (was duplicated in bad merge)
   keyPair:null, sharedKey:null, sessionCode:null,
   file:null, fileHasher:null, totalChunks:0, sentChunks:0, paused:false,
   fileMeta:null, chunks:[], rcvdChunks:0,
@@ -197,7 +183,7 @@ function createPeerConnection() {
   });
 
   pc.onicecandidate = ({ candidate }) => {
-    // FIX 3: filter null candidates AND empty-string sentinel candidates
+    // Filter null and empty-string sentinel candidates (fix 3)
     if (candidate && candidate.candidate !== '' && state.ws?.readyState === WebSocket.OPEN) {
       console.log('[ICE] Sending candidate:', candidate.type, candidate.protocol);
       state.ws.send(JSON.stringify({ type:'ice', candidate }));
@@ -208,7 +194,7 @@ function createPeerConnection() {
     console.log('[ICE] State:', pc.iceConnectionState);
     UI.setConnDot(pc.iceConnectionState);
     if (pc.iceConnectionState === 'failed') {
-      UI.status('ICE failed — peers could not connect directly. Try on the same network or add a TURN server.', 'error');
+      UI.status('ICE failed — peers could not connect directly. Must be on routable networks.', 'error');
       UI.setConnType('Failed');
     }
   };
@@ -254,9 +240,18 @@ function setupDataChannel(dc) {
     dc.send(JSON.stringify({ type:'ecdh-key', pub }));
   };
 
-  dc.onclose = () => { console.log('[DC] Closed'); if(!state.xferDone) UI.status('Channel closed.','info'); };
-  dc.onerror = (e) => { console.error('[DC] Error:',e); UI.status(`Channel error: ${e.message||'unknown'}`,'error'); };
+  dc.onclose = () => {
+    console.log('[DC] Closed');
+    if (!state.xferDone) UI.status('Channel closed.', 'info');
+  };
 
+  dc.onerror = (e) => {
+    console.error('[DC] Error:', e);
+    // Don't overwrite a completed-transfer status with a teardown error
+    if (!state.xferDone) UI.status(`Channel error: ${e.message||'unknown'}`, 'error');
+  };
+
+  // FIX 5: Use dc.onmessage (not `channel.onmessage`) and route properly
   dc.onmessage = async ({ data }) => {
     if (typeof data === 'string') {
       const msg = JSON.parse(data);
@@ -303,13 +298,13 @@ async function onControlMsg(msg) {
 
     case 'verified':
       state.xferDone = true;
-      if (msg.ok) { UI.status('✓ Verified — transfer complete!','success'); UI.showSendComplete(); }
-      else        { UI.status('⚠ Remote integrity check failed!','error'); }
+      if (msg.ok) { UI.status('✓ Verified — transfer complete!', 'success'); UI.showSendComplete(); }
+      else        { UI.status('⚠ Remote integrity check failed!', 'error'); }
       state.ws?.send(JSON.stringify({ type:'done' }));
       break;
 
-    case 'pause':  state.paused=true;  UI.status('Transfer paused.', 'info');  break;
-    case 'resume': state.paused=false; UI.status('Transfer resumed.','info'); break;
+    case 'pause':  state.paused=true;  UI.status('Transfer paused.',  'info'); break;
+    case 'resume': state.paused=false; UI.status('Transfer resumed.', 'info'); break;
   }
 }
 
@@ -334,10 +329,9 @@ async function startTransfer() {
   UI.setSendProgressVisible(true);
 
   for (let i = 0; i < totalChunks; i++) {
-    // Backpressure
     while (state.dc.bufferedAmount > CONFIG.MAX_BUFFER || state.paused) {
       await sleep(30);
-      if (state.dc.readyState !== 'open') { UI.status('Transfer aborted.','error'); return; }
+      if (state.dc.readyState !== 'open') { UI.status('Transfer aborted.', 'error'); return; }
     }
 
     const start     = i * CONFIG.CHUNK_SIZE;
@@ -345,11 +339,6 @@ async function startTransfer() {
     state.fileHasher.update(plain);
 
     const encrypted = await Crypto.encryptChunk(state.sharedKey, i, plain);
-
-    // Explicit size check — surface the error clearly if something is still wrong
-    if (encrypted.byteLength > 65536) {
-      console.warn('[SEND] Chunk', i, 'encrypted size:', encrypted.byteLength, '— may be too large');
-    }
 
     try {
       state.dc.send(encrypted);
@@ -376,7 +365,7 @@ async function onChunk(buf) {
   if (!state.sharedKey) return;
   let index, data;
   try { ({index,data} = await Crypto.decryptChunk(state.sharedKey, buf)); }
-  catch(e) { UI.status('⚠ Decryption failed — possible tampering!','error'); console.error(e); return; }
+  catch(e) { UI.status('⚠ Decryption failed — possible tampering!', 'error'); console.error(e); return; }
   state.chunks[index] = data;
   state.rcvdChunks++;
   state.bytesDone += data.length;
@@ -491,11 +480,9 @@ function connectSignaling(joinCode) {
         }
 
         case 'answer':
-          // Guard: only accept an answer when we're actually waiting for one.
-          // Safari mobile (and some CF Worker replays) can send a duplicate answer
-          // after the PC is already in 'stable' state, causing InvalidStateError.
+          // FIX 4: Guard against duplicate answers (Safari mobile / CF Worker replay)
           if (!state.pc || state.pc.signalingState !== 'have-local-offer') {
-            console.warn('[SEND] Ignoring answer — signalingState is', state.pc?.signalingState, '(expected have-local-offer)');
+            console.warn('[SEND] Ignoring answer in state:', state.pc?.signalingState);
             break;
           }
           console.log('[SEND] answer ←');
@@ -511,7 +498,7 @@ function connectSignaling(joinCode) {
             if (state.pc && state.pc.remoteDescription) {
               try {
                 await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                console.log('[ICE] Applied candidate (sdpMid:', msg.candidate.sdpMid, ')');
+                console.log('[ICE] Applied (sdpMid:', msg.candidate.sdpMid, ')');
               } catch(e) { console.warn('[ICE] Failed:', e.message); }
             } else {
               console.log('[ICE] Buffered');
@@ -527,7 +514,12 @@ function connectSignaling(joinCode) {
           break;
 
         case 'session-expired':
-          UI.status('Session expired.', 'error');
+          // P2P connection continues after signaling expires — only show error if not connected
+          if (!state.pc || state.pc.connectionState !== 'connected') {
+            UI.status('Session expired.', 'error');
+          } else {
+            console.log('[WS] Session expired — P2P still active, ignoring');
+          }
           break;
 
         case 'peer-disconnected':
@@ -631,15 +623,8 @@ function renderQR(text) {
 
 // ─── INIT ─────────────────────────────────────────────────────────
 
-async function initSend() {
-  state.mode='send';
-  await connectSignaling();
-}
-
-async function initReceive(code) {
-  state.mode='receive';
-  await connectSignaling(code);
-}
+async function initSend() { state.mode='send'; await connectSignaling(); }
+async function initReceive(code) { state.mode='receive'; await connectSignaling(code); }
 
 // ─── FILE QUEUE ───────────────────────────────────────────────────
 
@@ -759,11 +744,6 @@ async function init(){
 
   document.getElementById('pause-btn')?.addEventListener('click',togglePause);
   document.getElementById('reset-btn')?.addEventListener('click',()=>{ state.reset(); location.href=location.pathname; });
-
-  if(location.search.includes('share-target')){
-    const title=new URLSearchParams(location.search).get('title')||'';
-    UI.status(`Received share: "${esc(title)}" — select the file to send.`,'info');
-  }
 }
 
 document.addEventListener('DOMContentLoaded', init);
