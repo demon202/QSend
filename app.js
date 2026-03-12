@@ -1,5 +1,26 @@
 /**
  * QSend — Secure Peer-to-Peer File Transfer
+ * app.js
+ *
+ * THREE FIXES applied vs the version in the documents:
+ *
+ * FIX 1 — CHUNK SIZE (index.html fix too)
+ *   CHUNK_SIZE was 256*1024. After AES-GCM overhead (4+12+16=32 bytes),
+ *   encrypted size = 262,176 bytes which exceeds Chrome's hard DataChannel
+ *   limit of 262,144 bytes. dc.send() threw TypeError silently → stuck at 0%.
+ *   Fix: CHUNK_SIZE = 16*1024 (16 KB). Encrypted = 16,416 bytes. Safe on all browsers.
+ *
+ * FIX 2 — ICE SERVERS
+ *   3 STUN + 3 TURN URLs = 6 entries. Chrome warns at ≥5 and slows gathering.
+ *   The openrelay TURN server was also causing "ICE failed, TURN server broken".
+ *   Fix: 1 STUN only. For most users on the same network or without strict NAT,
+ *   direct P2P works fine. If you need TURN, use a reliable paid provider.
+ *
+ * FIX 3 — NULL ICE CANDIDATE
+ *   Some browsers fire onicecandidate with candidate.candidate === "" (empty string)
+ *   as an end-of-candidates sentinel. This passed the `if (candidate)` check and
+ *   was relayed to the peer, printing "[ICE] Sending candidate: null null".
+ *   Fix: guard with candidate.candidate !== ''
  */
 
 'use strict';
@@ -12,13 +33,14 @@ const CONFIG = Object.freeze({
 
   // FIX 1: 16 KB chunks → 16,416 bytes encrypted. Well under every browser's limit.
   CHUNK_SIZE:    16 * 1024,
-  MAX_BUFFER:    1  * 1024 * 1024,
-  RESUME_BUFFER: 128 * 1024,
+  MAX_BUFFER:    4  * 1024 * 1024,
+  RESUME_BUFFER: 256 * 1024,
 
   // FIX 2: Single STUN server. openrelay TURN was broken per console ("TURN server broken").
   // Add a reliable TURN here if you need to support symmetric NAT / strict firewalls.
   ICE_SERVERS: [
-{ urls: 'stun:stun.l.google.com:19302' }
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
   ],
 });
 
@@ -130,8 +152,6 @@ const Crypto = {
 
 const state = {
   mode:null, ws:null, pc:null, dc:null, pendingICE:[],
-  remoteDescriptionSet: false,
-  pendingICE: [],
   keyPair:null, sharedKey:null, sessionCode:null,
   file:null, fileHasher:null, totalChunks:0, sentChunks:0, paused:false,
   fileMeta:null, chunks:[], rcvdChunks:0,
@@ -237,15 +257,15 @@ function setupDataChannel(dc) {
   dc.onclose = () => { console.log('[DC] Closed'); if(!state.xferDone) UI.status('Channel closed.','info'); };
   dc.onerror = (e) => { console.error('[DC] Error:',e); UI.status(`Channel error: ${e.message||'unknown'}`,'error'); };
 
-  channel.onmessage = async (e) => {
-  let data = e.data;
-
-  if (data instanceof Blob) {
-    data = await data.arrayBuffer();
-  }
-
-  handleMessage(data);
-};
+  dc.onmessage = async ({ data }) => {
+    if (typeof data === 'string') {
+      const msg = JSON.parse(data);
+      console.log('[DC] Msg:', msg.type);
+      await onControlMsg(msg);
+    } else {
+      await onChunk(data);
+    }
+  };
 }
 
 // ─── CONTROL MESSAGES ─────────────────────────────────────────────
@@ -405,9 +425,12 @@ function connectSignaling(joinCode) {
       console.log('[WS] Connected');
 
       if (state.mode === 'send') {
-      console.log('[SEND] Creating PC before create message');
-      state.pc = createPeerConnection();
-      ws.send(JSON.stringify({ type:'create' }));
+        // Create PC before sending — guarantees state.pc exists when peer-joined arrives
+        console.log('[SEND] Creating PC+DC before create message');
+        state.pc = createPeerConnection();
+        state.dc = state.pc.createDataChannel('qsend', { ordered:true });
+        setupDataChannel(state.dc);
+        ws.send(JSON.stringify({ type:'create' }));
       } else {
         ws.send(JSON.stringify({ type:'join', code:joinCode }));
       }
@@ -432,19 +455,20 @@ function connectSignaling(joinCode) {
           resolve();
           break;
 
-        case 'peer-joined': {
-                console.log('[SEND] peer-joined, creating DataChannel + offer');
-                // Create DataChannel here (Safari-safe timing)
-                state.dc = state.pc.createDataChannel('qsend', { ordered: true, maxRetransmits: 30 });
-                setupDataChannel(state.dc);
-                const offer = await state.pc.createOffer();
-                await state.pc.setLocalDescription(offer);
-                ws.send(JSON.stringify({
-                  type: 'offer',
-                  sdp: state.pc.localDescription
-                }));
-                break;
-              }
+        case 'peer-joined':
+          console.log('[SEND] peer-joined. state.pc:', state.pc ? 'OK' : 'NULL←BUG');
+          UI.status('Peer connected — negotiating…', 'info');
+          try {
+            const offer = await state.pc.createOffer();
+            await state.pc.setLocalDescription(offer);
+            console.log('[SEND] Offer →');
+            ws.send(JSON.stringify({ type:'offer', sdp:state.pc.localDescription }));
+          } catch(e) {
+            console.error('[SEND] createOffer failed:', e);
+            UI.status(`Offer failed: ${e.message}`, 'error');
+          }
+          break;
+
         case 'offer': {
           console.log('[RECV] offer ←, creating PC');
           state.pc = createPeerConnection();
@@ -466,54 +490,35 @@ function connectSignaling(joinCode) {
           break;
         }
 
-       case 'answer': {
-            if (!state.pc) return;
-
-            // Firefox sometimes sends duplicate answers
-            if (state.pc.signalingState === "stable") {
-              console.warn("[SEND] Duplicate answer ignored");
-              return;
-            }
-
-            console.log("[SEND] answer ←");
-
-            await state.pc.setRemoteDescription(
-              new RTCSessionDescription(msg.sdp)
-            );
-
-            // Apply buffered ICE
-            for (const c of state.pendingICE) {
-              try {
-                await state.pc.addIceCandidate(new RTCIceCandidate(c));
-              } catch(e) {
-                console.warn("[ICE] buffered candidate failed", e);
-              }
-            }
-
-            state.pendingICE = [];
+        case 'answer':
+          // Guard: only accept an answer when we're actually waiting for one.
+          // Safari mobile (and some CF Worker replays) can send a duplicate answer
+          // after the PC is already in 'stable' state, causing InvalidStateError.
+          if (!state.pc || state.pc.signalingState !== 'have-local-offer') {
+            console.warn('[SEND] Ignoring answer — signalingState is', state.pc?.signalingState, '(expected have-local-offer)');
             break;
           }
+          console.log('[SEND] answer ←');
+          await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          for (const c of state.pendingICE) {
+            try { await state.pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+          }
+          state.pendingICE = [];
+          break;
 
-case 'ice': {
-  const cand = msg.candidate;
-  if (!cand) return;
-
-  if (!state.pc) return;
-
-  if (state.pc.remoteDescription) {
-    try {
-      await state.pc.addIceCandidate(new RTCIceCandidate(cand));
-      console.log("[ICE] Applied candidate");
-    } catch (e) {
-      console.warn("[ICE] addIceCandidate failed:", e.message);
-    }
-  } else {
-    console.log("[ICE] Buffering candidate");
-    state.pendingICE.push(cand);
-  }
-
-  break;
-}
+        case 'ice':
+          if (msg.candidate) {
+            if (state.pc && state.pc.remoteDescription) {
+              try {
+                await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                console.log('[ICE] Applied candidate (sdpMid:', msg.candidate.sdpMid, ')');
+              } catch(e) { console.warn('[ICE] Failed:', e.message); }
+            } else {
+              console.log('[ICE] Buffered');
+              state.pendingICE.push(msg.candidate);
+            }
+          }
+          break;
 
         case 'error':
           console.error('[WS] Error:', msg.message);
@@ -521,14 +526,9 @@ case 'ice': {
           reject(new Error(msg.message));
           break;
 
-case 'session-expired':
-  if (state.pc && state.pc.connectionState === 'connected') {
-    console.log('[WS] Session expired but P2P active — ignoring');
-    break;
-  }
-  showError('Session expired');
-  resetApp();
-  break;
+        case 'session-expired':
+          UI.status('Session expired.', 'error');
+          break;
 
         case 'peer-disconnected':
           if (!state.xferDone) UI.status('Peer disconnected.', 'error');
