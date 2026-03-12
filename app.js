@@ -11,15 +11,14 @@ const CONFIG = Object.freeze({
   })(),
 
   // FIX 1: 16 KB chunks → 16,416 bytes encrypted. Well under every browser's limit.
-  CHUNK_SIZE:    64 * 1024,
-  MAX_BUFFER:    2  * 1024 * 1024,
-  RESUME_BUFFER: 256 * 1024,
+  CHUNK_SIZE:    16 * 1024,
+  MAX_BUFFER:    1  * 1024 * 1024,
+  RESUME_BUFFER: 128 * 1024,
 
   // FIX 2: Single STUN server. openrelay TURN was broken per console ("TURN server broken").
   // Add a reliable TURN here if you need to support symmetric NAT / strict firewalls.
   ICE_SERVERS: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
+{ urls: 'stun:stun.l.google.com:19302' }
   ],
 });
 
@@ -132,6 +131,7 @@ const Crypto = {
 const state = {
   mode:null, ws:null, pc:null, dc:null, pendingICE:[],
   remoteDescriptionSet: false,
+  pendingICE: [],
   keyPair:null, sharedKey:null, sessionCode:null,
   file:null, fileHasher:null, totalChunks:0, sentChunks:0, paused:false,
   fileMeta:null, chunks:[], rcvdChunks:0,
@@ -237,15 +237,15 @@ function setupDataChannel(dc) {
   dc.onclose = () => { console.log('[DC] Closed'); if(!state.xferDone) UI.status('Channel closed.','info'); };
   dc.onerror = (e) => { console.error('[DC] Error:',e); UI.status(`Channel error: ${e.message||'unknown'}`,'error'); };
 
-  dc.onmessage = async ({ data }) => {
-    if (typeof data === 'string') {
-      const msg = JSON.parse(data);
-      console.log('[DC] Msg:', msg.type);
-      await onControlMsg(msg);
-    } else {
-      await onChunk(data);
-    }
-  };
+  channel.onmessage = async (e) => {
+  let data = e.data;
+
+  if (data instanceof Blob) {
+    data = await data.arrayBuffer();
+  }
+
+  handleMessage(data);
+};
 }
 
 // ─── CONTROL MESSAGES ─────────────────────────────────────────────
@@ -435,7 +435,7 @@ function connectSignaling(joinCode) {
         case 'peer-joined': {
                 console.log('[SEND] peer-joined, creating DataChannel + offer');
                 // Create DataChannel here (Safari-safe timing)
-                state.dc = state.pc.createDataChannel('qsend', { ordered: true });
+                state.dc = state.pc.createDataChannel('qsend', { ordered: true, maxRetransmits: 30 });
                 setupDataChannel(state.dc);
                 const offer = await state.pc.createOffer();
                 await state.pc.setLocalDescription(offer);
@@ -466,34 +466,54 @@ function connectSignaling(joinCode) {
           break;
         }
 
-        case 'answer':
-          console.log('[SEND] answer ←');
-          await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          state.remoteDescriptionSet = true;
-          for (const cand of state.pendingICE) {
-            try { await state.pc.addIceCandidate(cand); } catch {}
+       case 'answer': {
+            if (!state.pc) return;
+
+            // Firefox sometimes sends duplicate answers
+            if (state.pc.signalingState === "stable") {
+              console.warn("[SEND] Duplicate answer ignored");
+              return;
+            }
+
+            console.log("[SEND] answer ←");
+
+            await state.pc.setRemoteDescription(
+              new RTCSessionDescription(msg.sdp)
+            );
+
+            // Apply buffered ICE
+            for (const c of state.pendingICE) {
+              try {
+                await state.pc.addIceCandidate(new RTCIceCandidate(c));
+              } catch(e) {
+                console.warn("[ICE] buffered candidate failed", e);
+              }
+            }
+
+            state.pendingICE = [];
+            break;
           }
 
-          state.pendingICE = [];
-                    break;
+case 'ice': {
+  const cand = msg.candidate;
+  if (!cand) return;
 
-case 'ice':
-  
-  if (!msg.candidate) break;
+  if (!state.pc) return;
 
-  const candidate = new RTCIceCandidate(msg.candidate);
-
-  if (state.pc && state.remoteDescriptionSet) {
+  if (state.pc.remoteDescription) {
     try {
-      await state.pc.addIceCandidate(candidate);
-      console.log('[ICE] Applied');
+      await state.pc.addIceCandidate(new RTCIceCandidate(cand));
+      console.log("[ICE] Applied candidate");
     } catch (e) {
-      console.warn('[ICE] Failed', e);
+      console.warn("[ICE] addIceCandidate failed:", e.message);
     }
   } else {
-    state.pendingICE.push(candidate);
+    console.log("[ICE] Buffering candidate");
+    state.pendingICE.push(cand);
   }
+
   break;
+}
 
         case 'error':
           console.error('[WS] Error:', msg.message);
