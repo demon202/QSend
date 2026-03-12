@@ -1,26 +1,5 @@
 /**
  * QSend — Secure Peer-to-Peer File Transfer
- * app.js
- *
- * THREE FIXES applied vs the version in the documents:
- *
- * FIX 1 — CHUNK SIZE (index.html fix too)
- *   CHUNK_SIZE was 256*1024. After AES-GCM overhead (4+12+16=32 bytes),
- *   encrypted size = 262,176 bytes which exceeds Chrome's hard DataChannel
- *   limit of 262,144 bytes. dc.send() threw TypeError silently → stuck at 0%.
- *   Fix: CHUNK_SIZE = 16*1024 (16 KB). Encrypted = 16,416 bytes. Safe on all browsers.
- *
- * FIX 2 — ICE SERVERS
- *   3 STUN + 3 TURN URLs = 6 entries. Chrome warns at ≥5 and slows gathering.
- *   The openrelay TURN server was also causing "ICE failed, TURN server broken".
- *   Fix: 1 STUN only. For most users on the same network or without strict NAT,
- *   direct P2P works fine. If you need TURN, use a reliable paid provider.
- *
- * FIX 3 — NULL ICE CANDIDATE
- *   Some browsers fire onicecandidate with candidate.candidate === "" (empty string)
- *   as an end-of-candidates sentinel. This passed the `if (candidate)` check and
- *   was relayed to the peer, printing "[ICE] Sending candidate: null null".
- *   Fix: guard with candidate.candidate !== ''
  */
 
 'use strict';
@@ -426,12 +405,9 @@ function connectSignaling(joinCode) {
       console.log('[WS] Connected');
 
       if (state.mode === 'send') {
-        // Create PC before sending — guarantees state.pc exists when peer-joined arrives
-        console.log('[SEND] Creating PC+DC before create message');
-        state.pc = createPeerConnection();
-        state.dc = state.pc.createDataChannel('qsend', { ordered:true });
-        setupDataChannel(state.dc);
-        ws.send(JSON.stringify({ type:'create' }));
+      console.log('[SEND] Creating PC before create message');
+      state.pc = createPeerConnection();
+      ws.send(JSON.stringify({ type:'create' }));
       } else {
         ws.send(JSON.stringify({ type:'join', code:joinCode }));
       }
@@ -456,20 +432,19 @@ function connectSignaling(joinCode) {
           resolve();
           break;
 
-        case 'peer-joined':
-          console.log('[SEND] peer-joined. state.pc:', state.pc ? 'OK' : 'NULL←BUG');
-          UI.status('Peer connected — negotiating…', 'info');
-          try {
-            const offer = await state.pc.createOffer();
-            await state.pc.setLocalDescription(offer);
-            console.log('[SEND] Offer →');
-            ws.send(JSON.stringify({ type:'offer', sdp:state.pc.localDescription }));
-          } catch(e) {
-            console.error('[SEND] createOffer failed:', e);
-            UI.status(`Offer failed: ${e.message}`, 'error');
-          }
-          break;
-
+        case 'peer-joined': {
+                console.log('[SEND] peer-joined, creating DataChannel + offer');
+                // Create DataChannel here (Safari-safe timing)
+                state.dc = state.pc.createDataChannel('qsend', { ordered: true });
+                setupDataChannel(state.dc);
+                const offer = await state.pc.createOffer();
+                await state.pc.setLocalDescription(offer);
+                ws.send(JSON.stringify({
+                  type: 'offer',
+                  sdp: state.pc.localDescription
+                }));
+                break;
+              }
         case 'offer': {
           console.log('[RECV] offer ←, creating PC');
           state.pc = createPeerConnection();
