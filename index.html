@@ -3,41 +3,30 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-
-  <!-- Content Security Policy:
-       - No eval, no inline scripts (except the style block which is needed)
-       - Scripts only from self + cdnjs (for QR library with SRI)
-       - WebSocket to any wss:// for user-deployed signaling servers
-       - No frame embedding, no form submissions, no objects
-  -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self' wss: ws:; img-src 'self' data: blob:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';">
 
   <title>QSend — Secure P2P Transfer</title>
   <meta name="description" content="Encrypted peer-to-peer file transfer. Files go directly between browsers — no server, no storage, no tracking.">
   <meta name="theme-color" content="#060c18">
 
-  <!-- PWA -->
   <link rel="manifest" href="manifest.json">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23060c18'/%3E%3Ctext x='50%25' y='54%25' dominant-baseline='middle' text-anchor='middle' font-size='38' font-family='monospace' fill='%2300e5ff'%3EQ%3C/text%3E%3C/svg%3E">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="QSend">
 
-  <!-- Fonts: Space Mono (monospace) + Syne (display) -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
 
-  <!-- QR Code library (SRI verified) -->
+  <!-- FIX 1: Correct SRI hash — browser reported the real hash in the console error:
+       "The computed hash is CNgIRecGo7nphbeZ04Sc13ka07paqdeTu0WR1IM4kNcpmBAUSHSQX0FslNhTDadL4O5SAGapGt4FodqL8My0mA=="
+       Previous hash was wrong, causing the QR library to be blocked by CSP. -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
-          integrity="sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg=="
+          integrity="sha512-CNgIRecGo7nphbeZ04Sc13ka07paqdeTu0WR1IM4kNcpmBAUSHSQX0FslNhTDadL4O5SAGapGt4FodqL8My0mA=="
           crossorigin="anonymous" defer></script>
 
 <style>
-/* ═══════════════════════════════════════════
-   DESIGN: Terminal · Secure Operations aesthetic
-   Deep-space navy + electric cyan accent
-═══════════════════════════════════════════ */
 :root {
   --bg:         #060c18;
   --surface:    #0c1628;
@@ -59,325 +48,96 @@
   --r-lg:       10px;
   --t:          0.18s cubic-bezier(.4,0,.2,1);
 }
-
 *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
-
-html {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 14px;
-  line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
-}
-
-body {
-  min-height: 100vh;
-  background:
-    radial-gradient(ellipse 80% 50% at 20% -10%, rgba(0,100,180,.15) 0%,transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 110%, rgba(0,60,120,.12) 0%,transparent 60%),
-    var(--bg);
-  padding-bottom: 3rem;
-}
-
-body::before {
-  content:'';
-  position:fixed; inset:0;
-  background-image: radial-gradient(circle,rgba(0,229,255,.06) 1px,transparent 1px);
-  background-size: 28px 28px;
-  pointer-events:none; z-index:0;
-}
-
-.wrap {
-  position:relative; z-index:1;
-  max-width:960px; margin:0 auto; padding:0 1.25rem;
-}
-
-/* ── HEADER ─────────────────────────── */
-header {
-  padding:1.5rem 0 1rem;
-  display:flex; align-items:center; justify-content:space-between;
-  border-bottom:1px solid var(--border); margin-bottom:2rem;
-}
-
+html { background:var(--bg); color:var(--text); font-family:var(--mono); font-size:14px; line-height:1.6; -webkit-font-smoothing:antialiased; }
+body { min-height:100vh; background: radial-gradient(ellipse 80% 50% at 20% -10%,rgba(0,100,180,.15) 0%,transparent 60%), radial-gradient(ellipse 60% 40% at 80% 110%,rgba(0,60,120,.12) 0%,transparent 60%), var(--bg); padding-bottom:3rem; }
+body::before { content:''; position:fixed; inset:0; background-image:radial-gradient(circle,rgba(0,229,255,.06) 1px,transparent 1px); background-size:28px 28px; pointer-events:none; z-index:0; }
+.wrap { position:relative; z-index:1; max-width:960px; margin:0 auto; padding:0 1.25rem; }
+header { padding:1.5rem 0 1rem; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border); margin-bottom:2rem; }
 .logo { display:flex; align-items:center; gap:.7rem; }
-
-.logo-mark {
-  width:36px; height:36px;
-  border:2px solid var(--cyan); border-radius:var(--r);
-  display:flex; align-items:center; justify-content:center;
-  font-family:var(--sans); font-weight:800; font-size:18px;
-  color:var(--cyan);
-  box-shadow:0 0 12px var(--cyan-glow),inset 0 0 12px var(--cyan-glow);
-}
-
-.logo-text  { font-family:var(--sans); font-weight:800; font-size:1.3rem; color:var(--text-hi); }
-.logo-sub   { font-size:.65rem; color:var(--text-dim); letter-spacing:.08em; text-transform:uppercase; margin-top:1px; }
-
-.header-right {
-  display:flex; align-items:center; gap:.75rem;
-  font-size:.7rem; color:var(--text-dim); letter-spacing:.06em; text-transform:uppercase;
-}
-
-.conn-dot {
-  width:8px; height:8px; border-radius:50%;
-  background:var(--text-dim); flex-shrink:0;
-  transition:background var(--t),box-shadow var(--t);
-}
+.logo-mark { width:36px; height:36px; border:2px solid var(--cyan); border-radius:var(--r); display:flex; align-items:center; justify-content:center; font-family:var(--sans); font-weight:800; font-size:18px; color:var(--cyan); box-shadow:0 0 12px var(--cyan-glow),inset 0 0 12px var(--cyan-glow); }
+.logo-text { font-family:var(--sans); font-weight:800; font-size:1.3rem; color:var(--text-hi); }
+.logo-sub { font-size:.65rem; color:var(--text-dim); letter-spacing:.08em; text-transform:uppercase; margin-top:1px; }
+.header-right { display:flex; align-items:center; gap:.75rem; font-size:.7rem; color:var(--text-dim); letter-spacing:.06em; text-transform:uppercase; }
+.conn-dot { width:8px; height:8px; border-radius:50%; background:var(--text-dim); flex-shrink:0; transition:background var(--t),box-shadow var(--t); }
 .conn-dot.green  { background:var(--green); box-shadow:0 0 6px var(--green); }
 .conn-dot.yellow { background:var(--amber); box-shadow:0 0 6px var(--amber); animation:blink 1s infinite; }
 .conn-dot.red    { background:var(--red);   box-shadow:0 0 6px var(--red); }
-
-@keyframes blink { 0%,100%{opacity:1}50%{opacity:.4} }
-
-.tag {
-  padding:.15rem .5rem; border-radius:99px;
-  font-size:.6rem; letter-spacing:.08em; text-transform:uppercase;
-  background:rgba(0,229,255,.08); border:1px solid rgba(0,229,255,.15);
-  color:var(--cyan);
-}
-
-/* ── PANELS ─────────────────────────── */
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+.tag { padding:.15rem .5rem; border-radius:99px; font-size:.6rem; letter-spacing:.08em; text-transform:uppercase; background:rgba(0,229,255,.08); border:1px solid rgba(0,229,255,.15); color:var(--cyan); }
 .panels { display:grid; grid-template-columns:1fr 1fr; gap:1.25rem; }
 @media(max-width:640px){ .panels{grid-template-columns:1fr;} }
-
-.panel {
-  background:var(--surface); border:1px solid var(--border);
-  border-radius:var(--r-lg); padding:1.5rem;
-  position:relative; overflow:hidden;
-  animation:fadeIn .4s ease both;
-}
+.panel { background:var(--surface); border:1px solid var(--border); border-radius:var(--r-lg); padding:1.5rem; position:relative; overflow:hidden; animation:fadeIn .4s ease both; }
 .panel:nth-child(2){ animation-delay:.07s; }
-.panel::before {
-  content:''; position:absolute; top:0; left:0; right:0; height:2px;
-  background:linear-gradient(90deg,transparent,var(--cyan),transparent);
-  opacity:.3;
-}
+.panel::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--cyan),transparent); opacity:.3; }
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-
-.panel-title {
-  font-family:var(--sans); font-weight:600; font-size:.75rem;
-  letter-spacing:.15em; text-transform:uppercase; color:var(--cyan);
-  margin-bottom:1.25rem; display:flex; align-items:center; gap:.5rem;
-}
-.panel-title::before {
-  content:''; width:6px; height:6px; border-radius:50%;
-  background:var(--cyan); box-shadow:0 0 8px var(--cyan);
-}
-
-/* ── DROP ZONE ──────────────────────── */
-#drop-zone {
-  border:1.5px dashed var(--border-hi); border-radius:var(--r);
-  padding:2rem 1rem; text-align:center; cursor:pointer;
-  transition:all var(--t); user-select:none;
-}
-#drop-zone:hover, #drop-zone.drag-over {
-  border-color:var(--cyan); background:var(--cyan-glow);
-}
+.panel-title { font-family:var(--sans); font-weight:600; font-size:.75rem; letter-spacing:.15em; text-transform:uppercase; color:var(--cyan); margin-bottom:1.25rem; display:flex; align-items:center; gap:.5rem; }
+.panel-title::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--cyan); box-shadow:0 0 8px var(--cyan); }
+#drop-zone { border:1.5px dashed var(--border-hi); border-radius:var(--r); padding:2rem 1rem; text-align:center; cursor:pointer; transition:all var(--t); user-select:none; }
+#drop-zone:hover,#drop-zone.drag-over { border-color:var(--cyan); background:var(--cyan-glow); }
 #drop-zone.drag-over { transform:scale(1.01); }
-
-.drop-icon  { font-size:2rem; margin-bottom:.5rem; display:block; }
-.drop-text  { color:var(--text-dim); font-size:.8rem; }
-.drop-sub   { font-size:.7rem; color:var(--text-dim); margin-top:.25rem; opacity:.6; }
+.drop-icon { font-size:2rem; margin-bottom:.5rem; display:block; }
+.drop-text { color:var(--text-dim); font-size:.8rem; }
+.drop-sub { font-size:.7rem; color:var(--text-dim); margin-top:.25rem; opacity:.6; }
 #file-input { display:none; }
-
-/* ── FILE INFO ──────────────────────── */
-#file-info {
-  display:flex; align-items:center; gap:.75rem;
-  padding:.75rem; background:var(--surface-2);
-  border:1px solid var(--border-hi); border-radius:var(--r);
-  margin-top:.75rem;
-}
+#file-info { display:flex; align-items:center; gap:.75rem; padding:.75rem; background:var(--surface-2); border:1px solid var(--border-hi); border-radius:var(--r); margin-top:.75rem; }
 #file-info .file-icon { font-size:1.5rem; flex-shrink:0; }
 #file-info .fn { color:var(--text-hi); font-size:.8rem; word-break:break-all; }
 #file-info .fs { color:var(--text-dim); font-size:.7rem; margin-top:2px; }
-
-/* ── SESSION CODE ───────────────────── */
-#code-display {
-  margin-top:1rem; padding:1rem;
-  background:var(--surface-2); border:1px solid var(--border-hi);
-  border-radius:var(--r);
-}
-.code-label  { font-size:.65rem; letter-spacing:.12em; text-transform:uppercase; color:var(--text-dim); margin-bottom:.5rem; }
-#session-code {
-  font-size:2rem; font-weight:700; color:var(--cyan);
-  letter-spacing:.18em; text-shadow:0 0 20px rgba(0,229,255,.4);
-}
+#code-display { margin-top:1rem; padding:1rem; background:var(--surface-2); border:1px solid var(--border-hi); border-radius:var(--r); }
+.code-label { font-size:.65rem; letter-spacing:.12em; text-transform:uppercase; color:var(--text-dim); margin-bottom:.5rem; }
+#session-code { font-size:2rem; font-weight:700; color:var(--cyan); letter-spacing:.18em; text-shadow:0 0 20px rgba(0,229,255,.4); }
 .code-actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; }
-
-#qr-container {
-  margin-top:.75rem; display:flex; justify-content:center;
-  padding:.75rem; background:#0a0f1a;
-  border-radius:var(--r); border:1px solid var(--border);
-}
-#qr-container img, #qr-container canvas {
-  border-radius:4px; image-rendering:pixelated;
-}
-
-/* ── RECEIVE PANEL ──────────────────── */
-.code-input-label {
-  font-size:.7rem; color:var(--text-dim); letter-spacing:.08em;
-  text-transform:uppercase; margin-bottom:.5rem; display:block;
-}
-
-#receive-code-input {
-  width:100%; background:var(--surface-2);
-  border:1.5px solid var(--border-hi); border-radius:var(--r);
-  color:var(--text-hi); font-family:var(--mono);
-  font-size:1.6rem; font-weight:700; letter-spacing:.25em;
-  padding:.75rem 1rem; text-align:center; outline:none;
-  transition:border-color var(--t),box-shadow var(--t);
-  -webkit-appearance:none;
-}
-#receive-code-input:focus {
-  border-color:var(--cyan); box-shadow:0 0 0 3px var(--cyan-glow);
-}
+#qr-container { margin-top:.75rem; display:flex; justify-content:center; padding:.75rem; background:#0a0f1a; border-radius:var(--r); border:1px solid var(--border); }
+#qr-container img,#qr-container canvas { border-radius:4px; image-rendering:pixelated; }
+.code-input-label { font-size:.7rem; color:var(--text-dim); letter-spacing:.08em; text-transform:uppercase; margin-bottom:.5rem; display:block; }
+#receive-code-input { width:100%; background:var(--surface-2); border:1.5px solid var(--border-hi); border-radius:var(--r); color:var(--text-hi); font-family:var(--mono); font-size:1.6rem; font-weight:700; letter-spacing:.25em; padding:.75rem 1rem; text-align:center; outline:none; transition:border-color var(--t),box-shadow var(--t); -webkit-appearance:none; }
+#receive-code-input:focus { border-color:var(--cyan); box-shadow:0 0 0 3px var(--cyan-glow); }
 #receive-code-input::placeholder { color:var(--text-dim); letter-spacing:.1em; }
-
-#recv-meta {
-  display:flex; align-items:center; gap:.5rem; margin-top:.75rem;
-  padding:.6rem .75rem; background:var(--surface-2);
-  border-radius:var(--r); border:1px solid var(--border);
-}
+#recv-meta { display:flex; align-items:center; gap:.5rem; margin-top:.75rem; padding:.6rem .75rem; background:var(--surface-2); border-radius:var(--r); border:1px solid var(--border); }
 .meta-name { color:var(--text-hi); font-size:.8rem; flex:1; word-break:break-all; }
 .meta-size { color:var(--text-dim); font-size:.7rem; flex-shrink:0; }
-
-#recv-complete {
-  margin-top:.75rem; padding:.75rem;
-  background:rgba(0,255,136,.05); border:1px solid rgba(0,255,136,.2);
-  border-radius:var(--r); font-size:.7rem;
-}
+#recv-complete { margin-top:.75rem; padding:.75rem; background:rgba(0,255,136,.05); border:1px solid rgba(0,255,136,.2); border-radius:var(--r); font-size:.7rem; }
 .hash-label { color:var(--green); font-weight:700; letter-spacing:.1em; font-size:.65rem; text-transform:uppercase; }
 .hash-value { color:var(--text-dim); word-break:break-all; font-size:.65rem; margin-top:3px; line-height:1.4; }
-
-/* ── PROGRESS BARS ──────────────────── */
 .progress-wrap { margin-top:1rem; }
-.progress-header {
-  display:flex; justify-content:space-between; align-items:center;
-  margin-bottom:.35rem; font-size:.7rem; color:var(--text-dim);
-}
-.pct   { color:var(--cyan); font-weight:700; }
-.speed { color:var(--text-dim); }
-.progress-track {
-  width:100%; height:6px; background:var(--surface-2);
-  border-radius:99px; overflow:hidden; border:1px solid var(--border);
-}
-.progress-fill {
-  height:100%;
-  background:linear-gradient(90deg,var(--cyan-dim),var(--cyan));
-  border-radius:99px; width:0%; transition:width .3s ease;
-  position:relative; overflow:hidden;
-}
-.progress-fill::after {
-  content:''; position:absolute; top:0; left:-100%;
-  width:200%; height:100%;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.25),transparent);
-  animation:shimmer 1.8s infinite;
-}
+.progress-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:.35rem; font-size:.7rem; color:var(--text-dim); }
+.pct { color:var(--cyan); font-weight:700; }
+.progress-track { width:100%; height:6px; background:var(--surface-2); border-radius:99px; overflow:hidden; border:1px solid var(--border); }
+.progress-fill { height:100%; background:linear-gradient(90deg,var(--cyan-dim),var(--cyan)); border-radius:99px; width:0%; transition:width .3s ease; position:relative; overflow:hidden; }
+.progress-fill::after { content:''; position:absolute; top:0; left:-100%; width:200%; height:100%; background:linear-gradient(90deg,transparent,rgba(255,255,255,.25),transparent); animation:shimmer 1.8s infinite; }
 @keyframes shimmer{0%{transform:translateX(0%)}100%{transform:translateX(100%)}}
-
-.progress-wrap.complete .progress-fill {
-  background:linear-gradient(90deg,#006644,var(--green));
-}
-
-#send-complete {
-  margin-top:.75rem; padding:.6rem .75rem;
-  background:rgba(0,255,136,.06); border:1px solid rgba(0,255,136,.2);
-  border-radius:var(--r); color:var(--green);
-  font-size:.75rem; text-align:center; font-weight:700; letter-spacing:.05em;
-}
-
-/* ── BUTTONS ────────────────────────── */
-.btn {
-  display:inline-flex; align-items:center; justify-content:center;
-  gap:.4rem; padding:.6rem 1.2rem; border-radius:var(--r);
-  font-family:var(--mono); font-size:.78rem; font-weight:700;
-  letter-spacing:.06em; cursor:pointer; border:none;
-  transition:all var(--t); white-space:nowrap;
-  text-transform:uppercase; -webkit-appearance:none;
-}
+.progress-wrap.complete .progress-fill { background:linear-gradient(90deg,#006644,var(--green)); }
+#send-complete { margin-top:.75rem; padding:.6rem .75rem; background:rgba(0,255,136,.06); border:1px solid rgba(0,255,136,.2); border-radius:var(--r); color:var(--green); font-size:.75rem; text-align:center; font-weight:700; letter-spacing:.05em; }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:.4rem; padding:.6rem 1.2rem; border-radius:var(--r); font-family:var(--mono); font-size:.78rem; font-weight:700; letter-spacing:.06em; cursor:pointer; border:none; transition:all var(--t); white-space:nowrap; text-transform:uppercase; -webkit-appearance:none; }
 .btn:disabled { opacity:.4; cursor:not-allowed; }
-
-.btn-primary {
-  background:var(--cyan); color:var(--bg);
-  width:100%; margin-top:.75rem; padding:.75rem; font-size:.8rem;
-  box-shadow:0 2px 20px rgba(0,229,255,.2);
-}
-.btn-primary:not(:disabled):hover {
-  background:#33ecff; box-shadow:0 4px 28px rgba(0,229,255,.35);
-  transform:translateY(-1px);
-}
-.btn-primary:not(:disabled):active { transform:none; }
-
-.btn-ghost {
-  background:transparent; color:var(--text-dim);
-  border:1px solid var(--border-hi); padding:.4rem .8rem; font-size:.7rem;
-}
+.btn-primary { background:var(--cyan); color:var(--bg); width:100%; margin-top:.75rem; padding:.75rem; font-size:.8rem; box-shadow:0 2px 20px rgba(0,229,255,.2); }
+.btn-primary:not(:disabled):hover { background:#33ecff; box-shadow:0 4px 28px rgba(0,229,255,.35); transform:translateY(-1px); }
+.btn-ghost { background:transparent; color:var(--text-dim); border:1px solid var(--border-hi); padding:.4rem .8rem; font-size:.7rem; }
 .btn-ghost:hover { border-color:var(--cyan); color:var(--cyan); }
-
-.btn-danger {
-  background:transparent; color:var(--red);
-  border:1px solid rgba(255,68,102,.3); font-size:.7rem; padding:.35rem .75rem;
-}
+.btn-danger { background:transparent; color:var(--red); border:1px solid rgba(255,68,102,.3); font-size:.7rem; padding:.35rem .75rem; }
 .btn-danger:hover { background:rgba(255,68,102,.08); }
-
-/* ── STATUS MESSAGE ─────────────────── */
-#status-message {
-  margin-top:1.25rem; padding:.65rem 1rem;
-  border-radius:var(--r); font-size:.75rem; line-height:1.5;
-  border:1px solid var(--border); display:none;
-}
-.status-info    { background:rgba(0,100,180,.1);  border-color:rgba(0,150,255,.2);  color:#7dc8ff; }
-.status-success { background:rgba(0,255,136,.06); border-color:rgba(0,255,136,.2);  color:var(--green); }
-.status-error   { background:rgba(255,68,102,.08);border-color:rgba(255,68,102,.25);color:#ff8899; }
-
-/* ── SECURITY BAR ───────────────────── */
-.security-bar {
-  display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; align-items:center;
-  margin-top:1.5rem; padding:.75rem 1rem;
-  background:var(--surface); border:1px solid var(--border);
-  border-radius:var(--r); font-size:.65rem; color:var(--text-dim);
-  letter-spacing:.06em; text-transform:uppercase;
-}
+#status-message { margin-top:1.25rem; padding:.65rem 1rem; border-radius:var(--r); font-size:.75rem; line-height:1.5; border:1px solid var(--border); display:none; }
+.status-info    { background:rgba(0,100,180,.1);   border-color:rgba(0,150,255,.2);   color:#7dc8ff; }
+.status-success { background:rgba(0,255,136,.06);  border-color:rgba(0,255,136,.2);   color:var(--green); }
+.status-error   { background:rgba(255,68,102,.08); border-color:rgba(255,68,102,.25); color:#ff8899; }
+.security-bar { display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; align-items:center; margin-top:1.5rem; padding:.75rem 1rem; background:var(--surface); border:1px solid var(--border); border-radius:var(--r); font-size:.65rem; color:var(--text-dim); letter-spacing:.06em; text-transform:uppercase; }
 .sec-item { display:flex; align-items:center; gap:.35rem; }
 .sec-icon { font-size:.8rem; }
 #lock-icon { transition:filter var(--t); }
 #lock-icon.locked { filter:drop-shadow(0 0 4px var(--cyan)); }
 #enc-status { color:var(--text-dim); transition:color var(--t); }
 #enc-status.active { color:var(--cyan); }
-
-/* ── FOOTER ─────────────────────────── */
-footer {
-  margin-top:3rem; padding-top:1.5rem;
-  border-top:1px solid var(--border);
-  display:flex; flex-wrap:wrap; gap:.5rem 2rem;
-  font-size:.65rem; color:var(--text-dim); letter-spacing:.06em;
-}
+footer { margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--border); display:flex; flex-wrap:wrap; gap:.5rem 2rem; font-size:.65rem; color:var(--text-dim); letter-spacing:.06em; }
 footer a { color:var(--text-dim); text-decoration:none; }
 footer a:hover { color:var(--cyan); }
-
-/* ── UTILITIES ──────────────────────── */
 .hidden { display:none !important; }
-
-/* ── MOBILE ─────────────────────────── */
-@media(max-width:480px){
-  #session-code { font-size:1.5rem; }
-  .security-bar { font-size:.6rem; gap:.4rem 1rem; }
-  header { flex-direction:column; align-items:flex-start; gap:.75rem; }
-}
-
-/* ── SCROLLBAR ──────────────────────── */
-::-webkit-scrollbar        { width:6px; }
-::-webkit-scrollbar-track  { background:var(--bg); }
-::-webkit-scrollbar-thumb  { background:var(--border-hi); border-radius:3px; }
-::-webkit-scrollbar-thumb:hover { background:var(--cyan-dim); }
+@media(max-width:480px){ #session-code{font-size:1.5rem;} .security-bar{font-size:.6rem;gap:.4rem 1rem;} header{flex-direction:column;align-items:flex-start;gap:.75rem;} }
+::-webkit-scrollbar{width:6px;} ::-webkit-scrollbar-track{background:var(--bg);} ::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:3px;} ::-webkit-scrollbar-thumb:hover{background:var(--cyan-dim);}
 </style>
 </head>
-
 <body>
 <div class="wrap">
-
-  <!-- ═══ HEADER ═══════════════════════════════════════════ -->
   <header>
     <div class="logo">
       <div class="logo-mark">Q</div>
@@ -393,28 +153,17 @@ footer a:hover { color:var(--cyan); }
     </div>
   </header>
 
-
-  <!-- ═══ PANELS ═══════════════════════════════════════════ -->
   <div class="panels">
-
-    <!-- ── SEND ────────────────────────────── -->
     <div class="panel" id="send-panel">
       <div class="panel-title">Send File</div>
-
       <div id="drop-zone" role="button" tabindex="0" aria-label="Drop file here or click to browse">
         <span class="drop-icon">⬆</span>
         <div class="drop-text">Drop file here or click to browse</div>
         <div class="drop-sub">Any file type · Any size · Encrypted</div>
       </div>
       <input type="file" id="file-input" aria-label="Select file">
-
       <div id="file-info" class="hidden"></div>
-
-      <button class="btn btn-primary" id="send-btn" disabled aria-label="Connect and send file">
-        ⬆&nbsp; Send File
-      </button>
-
-      <!-- Session code (visible after connecting) -->
+      <button class="btn btn-primary" id="send-btn" disabled aria-label="Connect and send file">⬆&nbsp; Send File</button>
       <div id="code-display" class="hidden">
         <div class="code-label">Share this code with receiver</div>
         <div id="session-code" aria-live="polite">— — — — — —</div>
@@ -425,116 +174,55 @@ footer a:hover { color:var(--cyan); }
         </div>
         <div id="qr-container" class="hidden" aria-label="QR code for receiver"></div>
       </div>
-
-      <!-- Send progress -->
       <div id="send-progress-wrap" class="progress-wrap hidden">
         <div class="progress-header">
           <span>Sending</span>
-          <span>
-            <span class="pct" id="send-pct">0%</span>
-            &nbsp;·&nbsp;
-            <span class="speed" id="send-speed"></span>
-          </span>
+          <span><span class="pct" id="send-pct">0%</span>&nbsp;·&nbsp;<span class="speed" id="send-speed"></span></span>
         </div>
         <div class="progress-track">
           <div class="progress-fill" id="send-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
         </div>
       </div>
-
       <div id="send-complete" class="hidden">✓ Transfer complete — file delivered securely</div>
     </div>
 
-
-    <!-- ── RECEIVE ──────────────────────────── -->
     <div class="panel" id="receive-panel">
       <div class="panel-title">Receive File</div>
-
-      <label class="code-input-label" for="receive-code-input">
-        Enter 6-digit code from sender
-      </label>
-      <input
-        type="text"
-        id="receive-code-input"
-        inputmode="numeric"
-        autocomplete="off"
-        autocorrect="off"
-        spellcheck="false"
-        maxlength="6"
-        placeholder="000000"
-        aria-label="6-digit session code"
-      >
-
-      <button class="btn btn-primary" id="receive-btn" aria-label="Connect and receive file">
-        ↓&nbsp; Connect &amp; Receive
-      </button>
-
-      <!-- File info once transfer starts -->
+      <label class="code-input-label" for="receive-code-input">Enter 6-digit code from sender</label>
+      <input type="text" id="receive-code-input" inputmode="numeric" autocomplete="off" autocorrect="off" spellcheck="false" maxlength="6" placeholder="000000" aria-label="6-digit session code">
+      <button class="btn btn-primary" id="receive-btn" aria-label="Connect and receive file">↓&nbsp; Connect &amp; Receive</button>
       <div id="recv-meta" class="hidden"></div>
-
-      <!-- Receive progress -->
       <div id="recv-progress-wrap" class="progress-wrap hidden">
         <div class="progress-header">
           <span>Receiving</span>
-          <span>
-            <span class="pct" id="recv-pct">0%</span>
-            &nbsp;·&nbsp;
-            <span class="speed" id="recv-speed"></span>
-          </span>
+          <span><span class="pct" id="recv-pct">0%</span>&nbsp;·&nbsp;<span class="speed" id="recv-speed"></span></span>
         </div>
         <div class="progress-track">
           <div class="progress-fill" id="recv-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
         </div>
       </div>
-
-      <!-- Complete + hash -->
       <div id="recv-complete" class="hidden"></div>
-    </div>
-
-  </div><!-- /.panels -->
-
-
-  <!-- ═══ STATUS MESSAGE ═══════════════════════════════════ -->
-  <div id="status-message" role="status" aria-live="polite"></div>
-
-
-  <!-- ═══ SECURITY BAR ════════════════════════════════════ -->
-  <div class="security-bar" aria-label="Security information">
-    <div class="sec-item">
-      <span id="lock-icon" aria-hidden="true">🔓</span>
-      <span id="enc-status">Not encrypted</span>
-    </div>
-    <div class="sec-item">
-      <span class="sec-icon" aria-hidden="true">🔑</span>
-      <span>ECDH P-256</span>
-    </div>
-    <div class="sec-item">
-      <span class="sec-icon" aria-hidden="true">🔷</span>
-      <span>AES-256-GCM</span>
-    </div>
-    <div class="sec-item">
-      <span class="sec-icon" aria-hidden="true">🛡</span>
-      <span>SHA-256 verify</span>
-    </div>
-    <div class="sec-item">
-      <span class="sec-icon" aria-hidden="true">📡</span>
-      <span id="conn-type-bar">WebRTC DataChannel</span>
-    </div>
-    <div style="margin-left:auto">
-      <button class="btn btn-danger" id="reset-btn" aria-label="Reset and start over">✕ Reset</button>
     </div>
   </div>
 
+  <div id="status-message" role="status" aria-live="polite"></div>
 
-  <!-- ═══ FOOTER ══════════════════════════════════════════ -->
+  <div class="security-bar" aria-label="Security information">
+    <div class="sec-item"><span id="lock-icon" aria-hidden="true">🔓</span><span id="enc-status">Not encrypted</span></div>
+    <div class="sec-item"><span class="sec-icon">🔑</span><span>ECDH P-256</span></div>
+    <div class="sec-item"><span class="sec-icon">🔷</span><span>AES-256-GCM</span></div>
+    <div class="sec-item"><span class="sec-icon">🛡</span><span>SHA-256 verify</span></div>
+    <div class="sec-item"><span class="sec-icon">📡</span><span id="conn-type-bar">WebRTC DataChannel</span></div>
+    <div style="margin-left:auto"><button class="btn btn-danger" id="reset-btn" aria-label="Reset">✕ Reset</button></div>
+  </div>
+
   <footer>
     <span>QSend — Files never touch any server</span>
     <span>No cookies · No tracking · No analytics</span>
     <a href="https://github.com/your-org/qsend" target="_blank" rel="noopener noreferrer">GitHub</a>
     <span style="margin-left:auto">Sessions auto-expire after 5 min</span>
   </footer>
-
-</div><!-- /.wrap -->
-
+</div>
 <script src="app.js"></script>
 </body>
 </html>
