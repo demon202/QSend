@@ -33,18 +33,15 @@ const CONFIG = Object.freeze({
   MAX_BUFFER:    4   * 1024 * 1024,
   RESUME_BUFFER: 256 * 1024,
 
+  // 1 STUN + 1 TURN = 2 servers. Chrome warns and deprioritises when ≥5 are configured.
+  // The TURN fallback handles symmetric NAT (corporate networks, mobile hotspots, etc.)
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
     {
-      urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-      ],
+      urls:       'turn:openrelay.metered.ca:443?transport=tcp',
       username:   'openrelayproject',
       credential: 'openrelayproject',
     },
-    { urls: 'stun:global.stun.twilio.com:3478' },
   ],
 });
 
@@ -214,7 +211,11 @@ function createPeerConnection() {
   });
 
   pc.onicecandidate = ({ candidate }) => {
-    if (candidate && state.ws?.readyState === WebSocket.OPEN) {
+    // candidate === null  → end of gathering (normal, don't send)
+    // candidate.candidate === "" → end-of-candidates sentinel (some browsers send this
+    //   as a non-null object instead; sending it to the signaling server causes the
+    //   "null null" log and confuses the peer)
+    if (candidate && candidate.candidate !== '' && state.ws?.readyState === WebSocket.OPEN) {
       console.log('[ICE] Sending candidate:', candidate.type, candidate.protocol);
       state.ws.send(JSON.stringify({ type:'ice', candidate }));
     }
