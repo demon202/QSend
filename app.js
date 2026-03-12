@@ -32,8 +32,8 @@ const CONFIG = Object.freeze({
   })(),
 
   // FIX 1: 16 KB chunks → 16,416 bytes encrypted. Well under every browser's limit.
-  CHUNK_SIZE:    16 * 1024,
-  MAX_BUFFER:    4  * 1024 * 1024,
+  CHUNK_SIZE:    64 * 1024,
+  MAX_BUFFER:    2  * 1024 * 1024,
   RESUME_BUFFER: 256 * 1024,
 
   // FIX 2: Single STUN server. openrelay TURN was broken per console ("TURN server broken").
