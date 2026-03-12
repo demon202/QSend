@@ -519,9 +519,14 @@ function connectSignaling(joinCode) {
           reject(new Error(msg.message));
           break;
 
-        case 'session-expired':
-          UI.status('Session expired.', 'error');
-          break;
+case 'session-expired':
+  if (state.pc && state.pc.connectionState === 'connected') {
+    console.log('[WS] Session expired but P2P active — ignoring');
+    break;
+  }
+  showError('Session expired');
+  resetApp();
+  break;
 
         case 'peer-disconnected':
           if (!state.xferDone) UI.status('Peer disconnected.', 'error');
