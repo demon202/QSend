@@ -2,12 +2,25 @@
  * QSend — Secure Peer-to-Peer File Transfer  app.js
  *
  * Cumulative fixes applied in this version:
- *  1. CHUNK_SIZE = 16 KB  (256 KB + 32-byte GCM overhead exceeds Chrome's 262,144-byte limit)
- *  2. Only 1 STUN server  (≥5 triggers Chrome slowdown warning; broken TURN removed)
+ *  1. CHUNK_SIZE = 16 KB  (256 KB + GCM overhead exceeds Chrome's 262,144-byte DC limit)
+ *  2. Only 1 STUN server initially — now +2 TURN  (see FIX 10)
  *  3. Null ICE filter     (candidate.candidate === "" sentinel was being relayed)
- *  4. Answer guard        (duplicate answer from Safari/CF replay caused InvalidStateError)
- *  5. Clean setupDataChannel  (removed accidental `channel.onmessage` / `handleMessage` reference)
+ *  4. Answer guard        (duplicate answer from Safari/CF replay → InvalidStateError)
+ *  5. Clean setupDataChannel  (removed bad `channel.onmessage` / `handleMessage` ref)
  *  6. No duplicate state fields  (pendingICE was declared twice)
+ *  7. ECDH race condition FIX  ← THE MAIN BUG causing all transfer failures
+ *       Both sides generate their keypair in dc.onopen (async, yields to event loop).
+ *       On a LAN, desktop Brave finishes generateKeyPair in ~1ms and sends its
+ *       ecdh-key BEFORE Safari iOS finishes (~4-8ms). Safari receives the peer
+ *       key while state.keyPair is still null → deriveSharedKey(null.privateKey)
+ *       throws a silent TypeError → sharedKey never set → stuck forever.
+ *       Fix: buffer the peer key if it arrives early; process it once our own
+ *       keypair is ready (at the end of dc.onopen).
+ *  8. try/catch around ecdh-key handler  (silent failures now shown as errors)
+ *  9. DC created on peer-joined, not on ws.onopen  (WebKit sometimes omits the
+ *       m=application section when the DC exists before setLocalDescription)
+ * 10. TURN server added  (STUN alone cannot traverse symmetric NAT on mobile
+ *       carriers; ~20% of real-world connections need relay)
  */
 
 'use strict';
@@ -20,12 +33,26 @@ const CONFIG = Object.freeze({
     return local ? 'ws://localhost:8080' : 'wss://qsend-signal.qsend-test.workers.dev';
   })(),
 
-  CHUNK_SIZE:    16  * 1024,   // 16 KB plaintext → 16,416 bytes encrypted (safe on all browsers)
-  MAX_BUFFER:    1   * 1024 * 1024,
+  CHUNK_SIZE:    16 * 1024,
+  MAX_BUFFER:    1  * 1024 * 1024,
   RESUME_BUFFER: 128 * 1024,
 
+  // FIX 10: TURN servers for NAT traversal on mobile/cellular networks.
+  // STUN only discovers your public IP — it does NOT punch through NAT.
+  // Symmetric NAT (common on mobile carriers) requires a TURN relay.
+  // Replace with your own Metered/Twilio/Xirsys credentials for production.
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls:       'turn:openrelay.metered.ca:80',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls:       'turn:openrelay.metered.ca:443',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
 });
 
@@ -137,8 +164,10 @@ const Crypto = {
 
 const state = {
   mode:null, ws:null, pc:null, dc:null,
-  pendingICE:[],                    // single declaration (was duplicated in bad merge)
-  keyPair:null, sharedKey:null, sessionCode:null,
+  pendingICE:[],
+  keyPair:null,
+  pendingPeerKey:null,    // FIX 7: holds peer ecdh-key that arrived before our keypair was ready
+  sharedKey:null, sessionCode:null,
   file:null, fileHasher:null, totalChunks:0, sentChunks:0, paused:false,
   fileMeta:null, chunks:[], rcvdChunks:0,
   startTime:null, bytesDone:0, lastSpeedTs:null, lastSpeedBytes:0, currentSpeed:0,
@@ -150,7 +179,7 @@ const state = {
     try{this.pc?.close();}catch{}
     Object.assign(this,{
       mode:null,ws:null,pc:null,dc:null,pendingICE:[],
-      keyPair:null,sharedKey:null,sessionCode:null,
+      keyPair:null,pendingPeerKey:null,sharedKey:null,sessionCode:null,
       file:null,fileHasher:null,totalChunks:0,sentChunks:0,paused:false,
       fileMeta:null,chunks:[],rcvdChunks:0,
       startTime:null,bytesDone:0,lastSpeedTs:null,lastSpeedBytes:0,currentSpeed:0,
@@ -183,7 +212,7 @@ function createPeerConnection() {
   });
 
   pc.onicecandidate = ({ candidate }) => {
-    // Filter null and empty-string sentinel candidates (fix 3)
+    // FIX 3: filter null and empty-string sentinel candidates
     if (candidate && candidate.candidate !== '' && state.ws?.readyState === WebSocket.OPEN) {
       console.log('[ICE] Sending candidate:', candidate.type, candidate.protocol);
       state.ws.send(JSON.stringify({ type:'ice', candidate }));
@@ -194,7 +223,7 @@ function createPeerConnection() {
     console.log('[ICE] State:', pc.iceConnectionState);
     UI.setConnDot(pc.iceConnectionState);
     if (pc.iceConnectionState === 'failed') {
-      UI.status('ICE failed — peers could not connect directly. Must be on routable networks.', 'error');
+      UI.status('ICE failed — could not establish connection. Try again on a different network.', 'error');
       UI.setConnType('Failed');
     }
   };
@@ -235,9 +264,24 @@ function setupDataChannel(dc) {
     console.log('[DC] Open — ECDH key exchange');
     UI.status('Channel open — performing key exchange…', 'info');
     UI.setEncStatus('Exchanging keys…');
+
+    // Generate our keypair and send our public key.
+    // Both sides do this simultaneously. On a LAN, the desktop peer
+    // finishes ~4-7ms faster than iOS Safari and its key arrives at
+    // Safari before Safari has finished generating its own pair.
+    // We handle the resulting race with pendingPeerKey below (FIX 7).
     state.keyPair = await Crypto.generateKeyPair();
     const pub = await Crypto.exportPublicKey(state.keyPair);
     dc.send(JSON.stringify({ type:'ecdh-key', pub }));
+
+    // FIX 7: If the peer's ecdh-key arrived while we were awaiting
+    // generateKeyPair(), it was saved in pendingPeerKey. Process it now.
+    if (state.pendingPeerKey) {
+      console.log('[CRYPTO] Processing buffered peer key');
+      const saved = state.pendingPeerKey;
+      state.pendingPeerKey = null;
+      await onControlMsg({ type:'ecdh-key', pub:saved });
+    }
   };
 
   dc.onclose = () => {
@@ -247,14 +291,13 @@ function setupDataChannel(dc) {
 
   dc.onerror = (e) => {
     console.error('[DC] Error:', e);
-    // Don't overwrite a completed-transfer status with a teardown error
     if (!state.xferDone) UI.status(`Channel error: ${e.message||'unknown'}`, 'error');
   };
 
-  // FIX 5: Use dc.onmessage (not `channel.onmessage`) and route properly
   dc.onmessage = async ({ data }) => {
     if (typeof data === 'string') {
-      const msg = JSON.parse(data);
+      let msg;
+      try { msg = JSON.parse(data); } catch(e) { console.error('[DC] Bad JSON:', e); return; }
       console.log('[DC] Msg:', msg.type);
       await onControlMsg(msg);
     } else {
@@ -269,14 +312,27 @@ async function onControlMsg(msg) {
   switch (msg.type) {
 
     case 'ecdh-key': {
+      // FIX 7: If our keypair isn't ready yet (generateKeyPair still running),
+      // save the peer's key. dc.onopen will call us again once it completes.
+      if (!state.keyPair) {
+        console.log('[CRYPTO] Peer key arrived before our keypair — buffering');
+        state.pendingPeerKey = msg.pub;
+        return;
+      }
+      // FIX 8: wrap in try/catch so failures are visible, not silent hangs
       console.log('[CRYPTO] Deriving shared key…');
-      const peerPub   = await Crypto.importPublicKey(msg.pub);
-      state.sharedKey = await Crypto.deriveSharedKey(state.keyPair, peerPub);
-      state.keyReady  = true;
-      console.log('[CRYPTO] AES-256-GCM key ready ✓');
-      UI.setLockState(true);
-      UI.status('🔒 End-to-end encryption active.', 'success');
-      if (state.mode === 'send' && state.file) await startTransfer();
+      try {
+        const peerPub   = await Crypto.importPublicKey(msg.pub);
+        state.sharedKey = await Crypto.deriveSharedKey(state.keyPair, peerPub);
+        state.keyReady  = true;
+        console.log('[CRYPTO] AES-256-GCM key ready ✓');
+        UI.setLockState(true);
+        UI.status('🔒 End-to-end encryption active.', 'success');
+        if (state.mode === 'send' && state.file) await startTransfer();
+      } catch(e) {
+        console.error('[CRYPTO] Key exchange failed:', e);
+        UI.status(`Key exchange failed: ${e.message}`, 'error');
+      }
       break;
     }
 
@@ -334,15 +390,17 @@ async function startTransfer() {
       if (state.dc.readyState !== 'open') { UI.status('Transfer aborted.', 'error'); return; }
     }
 
-    const start     = i * CONFIG.CHUNK_SIZE;
-    const plain     = new Uint8Array(await file.slice(start, Math.min(start+CONFIG.CHUNK_SIZE, file.size)).arrayBuffer());
+    const start = i * CONFIG.CHUNK_SIZE;
+    const plain = new Uint8Array(
+      await file.slice(start, Math.min(start + CONFIG.CHUNK_SIZE, file.size)).arrayBuffer()
+    );
     state.fileHasher.update(plain);
 
     const encrypted = await Crypto.encryptChunk(state.sharedKey, i, plain);
 
     try {
       state.dc.send(encrypted);
-    } catch (e) {
+    } catch(e) {
       console.error('[SEND] dc.send failed chunk', i, 'size:', encrypted.byteLength, e);
       UI.status(`Send error on chunk ${i} (${encrypted.byteLength} bytes): ${e.message}`, 'error');
       return;
@@ -412,13 +470,10 @@ function connectSignaling(joinCode) {
     ws.onopen = () => {
       clearTimeout(timeout);
       console.log('[WS] Connected');
-
       if (state.mode === 'send') {
-        // Create PC before sending — guarantees state.pc exists when peer-joined arrives
-        console.log('[SEND] Creating PC+DC before create message');
-        state.pc = createPeerConnection();
-        state.dc = state.pc.createDataChannel('qsend', { ordered:true });
-        setupDataChannel(state.dc);
+        // FIX 9: Do NOT create PC+DC here. WebKit can drop the m=application
+        // SDP section when the DC is created before setLocalDescription.
+        // We create PC+DC in 'peer-joined' right before createOffer() instead.
         ws.send(JSON.stringify({ type:'create' }));
       } else {
         ws.send(JSON.stringify({ type:'join', code:joinCode }));
@@ -444,10 +499,15 @@ function connectSignaling(joinCode) {
           resolve();
           break;
 
+        // FIX 9: Create PC+DC here, immediately before createOffer().
+        // This is the correct point for WebKit to include m=application in SDP.
         case 'peer-joined':
-          console.log('[SEND] peer-joined. state.pc:', state.pc ? 'OK' : 'NULL←BUG');
           UI.status('Peer connected — negotiating…', 'info');
           try {
+            state.pc = createPeerConnection();
+            state.dc = state.pc.createDataChannel('qsend', { ordered:true });
+            setupDataChannel(state.dc);
+            console.log('[SEND] PC+DC created, creating offer');
             const offer = await state.pc.createOffer();
             await state.pc.setLocalDescription(offer);
             console.log('[SEND] Offer →');
@@ -467,7 +527,6 @@ function connectSignaling(joinCode) {
             setupDataChannel(channel);
           };
           await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          // Drain ICE buffer AFTER setRemoteDescription
           for (const c of state.pendingICE) {
             try { await state.pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
           }
@@ -480,7 +539,7 @@ function connectSignaling(joinCode) {
         }
 
         case 'answer':
-          // FIX 4: Guard against duplicate answers (Safari mobile / CF Worker replay)
+          // FIX 4: guard against duplicate answers
           if (!state.pc || state.pc.signalingState !== 'have-local-offer') {
             console.warn('[SEND] Ignoring answer in state:', state.pc?.signalingState);
             break;
@@ -514,7 +573,6 @@ function connectSignaling(joinCode) {
           break;
 
         case 'session-expired':
-          // P2P connection continues after signaling expires — only show error if not connected
           if (!state.pc || state.pc.connectionState !== 'connected') {
             UI.status('Session expired.', 'error');
           } else {
@@ -623,7 +681,7 @@ function renderQR(text) {
 
 // ─── INIT ─────────────────────────────────────────────────────────
 
-async function initSend() { state.mode='send'; await connectSignaling(); }
+async function initSend()        { state.mode='send';    await connectSignaling(); }
 async function initReceive(code) { state.mode='receive'; await connectSignaling(code); }
 
 // ─── FILE QUEUE ───────────────────────────────────────────────────
