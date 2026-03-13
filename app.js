@@ -384,6 +384,19 @@ async function startTransfer() {
   UI.status(`Sending ${esc(file.name)}…`, 'info');
   UI.setSendProgressVisible(true);
 
+  // Read the entire file into memory ONCE before the send loop.
+  // Safari iOS (and some Edge versions) can detach or throw on File.slice()
+  // after many async yield cycles (the sleep(30) backpressure loop).
+  // Reading upfront avoids that entirely. For very large files this trades
+  // memory for reliability — acceptable given the P2P transfer context.
+  let fileBuf;
+  try {
+    fileBuf = new Uint8Array(await file.arrayBuffer());
+  } catch(e) {
+    UI.status(`Could not read file: ${e.message}`, 'error');
+    return;
+  }
+
   for (let i = 0; i < totalChunks; i++) {
     while (state.dc.bufferedAmount > CONFIG.MAX_BUFFER || state.paused) {
       await sleep(30);
@@ -391,15 +404,15 @@ async function startTransfer() {
     }
 
     const start = i * CONFIG.CHUNK_SIZE;
-    const plain = new Uint8Array(
-      await file.slice(start, Math.min(start + CONFIG.CHUNK_SIZE, file.size)).arrayBuffer()
-    );
+    const plain = fileBuf.subarray(start, Math.min(start + CONFIG.CHUNK_SIZE, file.size));
     state.fileHasher.update(plain);
 
     const encrypted = await Crypto.encryptChunk(state.sharedKey, i, plain);
 
     try {
-      state.dc.send(encrypted);
+      // Send as Uint8Array, not ArrayBuffer — Safari and some Edge versions
+      // silently drop or error on dc.send(ArrayBuffer) for binary transfers.
+      state.dc.send(new Uint8Array(encrypted));
     } catch(e) {
       console.error('[SEND] dc.send failed chunk', i, 'size:', encrypted.byteLength, e);
       UI.status(`Send error on chunk ${i} (${encrypted.byteLength} bytes): ${e.message}`, 'error');
@@ -448,12 +461,19 @@ async function finalizeReceive(expected) {
   const blob = new Blob(state.chunks, { type:state.fileMeta.mimeType });
   const url  = URL.createObjectURL(blob);
   const a    = Object.assign(document.createElement('a'), { href:url, download:state.fileMeta.name });
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+
+  // Mark done and notify sender BEFORE triggering the download dialog.
+  // This ensures any session-expired or DC-close events that arrive while
+  // the browser is showing the save prompt don't overwrite the success status.
   state.chunks=[]; state.xferDone=true;
   state.dc.send(JSON.stringify({ type:'verified', ok:true }));
   UI.status('✓ File saved — SHA-256 verified.', 'success');
   UI.showReceiveComplete(actual);
+
+  // Trigger the download. revokeObjectURL is delayed generously so the
+  // browser has time to start the download before the blob is released.
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 // ─── SIGNALING ────────────────────────────────────────────────────
@@ -573,10 +593,13 @@ function connectSignaling(joinCode) {
           break;
 
         case 'session-expired':
-          if (!state.pc || state.pc.connectionState !== 'connected') {
+          // Never show "session expired" if the transfer already completed —
+          // the session expires naturally right after the receiver triggers
+          // the download, so xferDone guards against overwriting the success msg.
+          if (!state.xferDone && (!state.pc || state.pc.connectionState !== 'connected')) {
             UI.status('Session expired.', 'error');
           } else {
-            console.log('[WS] Session expired — P2P still active, ignoring');
+            console.log('[WS] Session expired — ignoring (xferDone or P2P still active)');
           }
           break;
 
