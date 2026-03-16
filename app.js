@@ -241,19 +241,23 @@ function createPeerConnection() {
   state.dc = dc;
   setupDataChannel(dc);
 
-  // Perfect Negotiation: onnegotiationneeded handles offer creation for both sides.
+  // onnegotiationneeded: backup handler for renegotiation cases.
+  // The initial offer is sent explicitly in the 'peer-joined' handler to
+  // work around Safari iOS not firing this event for negotiated DataChannels.
+  // makingOffer guard prevents double-offer if this DOES fire on Chrome/Firefox.
   pc.onnegotiationneeded = async () => {
+    if (state.makingOffer) {
+      console.log('[PC] onnegotiationneeded skipped — offer already in progress');
+      return;
+    }
     try {
       state.makingOffer = true;
-      // Use explicit createOffer() — setLocalDescription() with no args
-      // is only fully supported from Safari 15.4+. Older iOS silently
-      // throws inside the try/catch and never sends the offer.
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       state.ws?.send(JSON.stringify({ type:'description', sdp:pc.localDescription }));
+      console.log('[PC] onnegotiationneeded — offer sent');
     } catch(e) {
       console.error('[PC] onnegotiationneeded error:', e);
-      UI.status('Failed to create offer: ' + (e.message||e), 'error');
     } finally {
       state.makingOffer = false;
     }
@@ -549,19 +553,38 @@ function connectSignaling(joinCode) {
           break;
 
         case 'joined':
-          // Receiver is POLITE — it yields if there's a simultaneous offer
+          // Receiver is POLITE — create PC eagerly so it's ready when the
+          // offer arrives. Creating it lazily inside 'description' can cause
+          // onnegotiationneeded to race with the incoming offer.
           state.polite = true;
+          state.pc = createPeerConnection();
           UI.status('Joined session — establishing P2P connection…', 'info');
           resolve();
           break;
 
-        // peer-joined: receiver connected — create PC and let onnegotiationneeded
-        // handle the offer. This is the only place we create the PC.
+        // peer-joined: receiver connected — create PC and explicitly send offer.
+        // We do NOT rely on onnegotiationneeded here because Safari iOS has a
+        // confirmed bug: when a DataChannel is created with {negotiated:true},
+        // Safari never fires onnegotiationneeded (it treats "negotiated" as
+        // "no negotiation needed at all"). Chrome iOS (WKWebView) does not have
+        // this bug, which is why Chrome iOS works and Safari iOS doesn't.
         case 'peer-joined':
           UI.status('Peer connected — setting up encrypted channel…', 'info');
           state.pc = createPeerConnection();
-          // onnegotiationneeded fires automatically because of the DC creation
-          // inside createPeerConnection(). No manual createOffer() needed.
+          // Set makingOffer=true immediately so onnegotiationneeded (if it
+          // does fire on non-Safari browsers) doesn't race with us.
+          state.makingOffer = true;
+          try {
+            const offer = await state.pc.createOffer();
+            await state.pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type:'description', sdp:state.pc.localDescription }));
+            console.log('[SEND] Offer sent explicitly (Safari onnegotiationneeded bypass)');
+          } catch(e) {
+            console.error('[SEND] createOffer failed:', e);
+            UI.status('Offer failed: ' + (e.message||e), 'error');
+          } finally {
+            state.makingOffer = false;
+          }
           break;
 
         // peer-present: sent to the RECEIVER when they join a session that
