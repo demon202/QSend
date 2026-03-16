@@ -41,6 +41,38 @@
 
 'use strict';
 
+// ─── ON-SCREEN DIAGNOSTICS ────────────────────────────────────────
+// Visible debug log so mobile users don't need DevTools.
+// Remove this block (and calls to dbg()) for production.
+(function(){
+  const panel = document.createElement('div');
+  panel.id = 'dbg-panel';
+  panel.style.cssText = [
+    'position:fixed','bottom:0','left:0','right:0','max-height:40vh',
+    'overflow-y:auto','background:rgba(0,0,0,0.92)','color:#0f0',
+    'font:11px/1.4 monospace','padding:6px','z-index:9999',
+    'border-top:1px solid #0f0','white-space:pre-wrap','word-break:break-all'
+  ].join(';');
+  document.addEventListener('DOMContentLoaded', () => document.body.appendChild(panel));
+  window._dbg = function(tag, ...args) {
+    const line = '[' + tag + '] ' + args.map(a => {
+      try { return (typeof a === 'object') ? JSON.stringify(a) : String(a); } catch { return String(a); }
+    }).join(' ');
+    console.log(line);
+    const p = document.getElementById('dbg-panel');
+    if (p) {
+      p.textContent += '\n' + line;
+      p.scrollTop = p.scrollHeight;
+    }
+  };
+  // Capture unhandled promise rejections
+  window.addEventListener('unhandledrejection', e => {
+    window._dbg('UNHANDLED', e.reason?.message || e.reason || e);
+  });
+})();
+const dbg = window._dbg;
+
+
 // ─── CONFIG ───────────────────────────────────────────────────────
 
 const CONFIG = Object.freeze({
@@ -241,11 +273,11 @@ function createPeerConnection() {
   // Perfect Negotiation: onnegotiationneeded handles offer creation for both sides.
   pc.onnegotiationneeded = async () => {
     try {
-      state.makingOffer = true;
+      state.makingOffer = true; dbg('NEG', 'onnegotiationneeded fired, creating offer');
       await pc.setLocalDescription();           // browser picks offer/answer automatically
       state.ws?.send(JSON.stringify({ type:'description', sdp:pc.localDescription }));
     } catch(e) {
-      console.error('[PC] onnegotiationneeded error:', e);
+      console.error('[PC] onnegotiationneeded error:', e); dbg('NEG-ERR', e.message||e);
     } finally {
       state.makingOffer = false;
     }
@@ -254,13 +286,13 @@ function createPeerConnection() {
   pc.onicecandidate = ({ candidate }) => {
     // Filter empty sentinel candidates
     if (candidate && candidate.candidate !== '' && state.ws?.readyState === WebSocket.OPEN) {
-      console.log('[ICE] Sending:', candidate.type, candidate.protocol);
+      console.log('[ICE] Sending:', candidate.type, candidate.protocol); dbg('ICE→', candidate.type, candidate.protocol||'');
       state.ws.send(JSON.stringify({ type:'ice', candidate }));
     }
   };
 
   pc.oniceconnectionstatechange = () => {
-    console.log('[ICE] State:', pc.iceConnectionState);
+    console.log('[ICE] State:', pc.iceConnectionState); dbg('ICE', pc.iceConnectionState);
     UI.setConnDot(pc.iceConnectionState);
     if (pc.iceConnectionState === 'failed') {
       UI.status('ICE failed — could not connect. Try again on a different network.', 'error');
@@ -269,11 +301,11 @@ function createPeerConnection() {
   };
 
   pc.onconnectionstatechange = () => {
-    console.log('[PC] Connection:', pc.connectionState);
+    console.log('[PC] Connection:', pc.connectionState); dbg('PC', pc.connectionState);
     if (pc.connectionState === 'connected') detectConnType(pc);
   };
 
-  pc.onsignalingstatechange = () => console.log('[PC] Signaling:', pc.signalingState);
+  pc.onsignalingstatechange = () => { console.log('[PC] Signaling:', pc.signalingState); dbg('SIG', pc.signalingState); };
 
   return pc;
 }
@@ -299,7 +331,7 @@ function setupDataChannel(dc) {
   dc.bufferedAmountLowThreshold = CONFIG.RESUME_BUFFER;
 
   dc.onopen = async () => {
-    console.log('[DC] Open — ECDH key exchange');
+    console.log('[DC] Open — ECDH key exchange'); dbg('DC', 'OPEN — key exchange starting');
     UI.status('Channel open — performing key exchange…', 'info');
     UI.setEncStatus('Exchanging keys…');
 
@@ -320,12 +352,12 @@ function setupDataChannel(dc) {
   };
 
   dc.onclose = () => {
-    console.log('[DC] Closed');
+    console.log('[DC] Closed'); dbg('DC', 'closed, xferDone='+state.xferDone);
     if (!state.xferDone) UI.status('Channel closed.', 'info');
   };
 
   dc.onerror = (e) => {
-    console.error('[DC] Error:', e);
+    console.error('[DC] Error:', e); dbg('DC-ERR', e.message||e);
     if (!state.xferDone) UI.status(`Channel error: ${e.message||'unknown'}`, 'error');
   };
 
@@ -349,21 +381,21 @@ async function onControlMsg(msg) {
     case 'ecdh-key': {
       // Buffer if our keypair isn't ready yet (generateKeyPair still awaiting)
       if (!state.keyPair) {
-        console.log('[CRYPTO] Peer key arrived early — buffering');
+        console.log('[CRYPTO] Peer key arrived early — buffering'); dbg('CRYPTO', 'peer key buffered (our keypair not ready yet)');
         state.pendingPeerKey = msg.pub;
         return;
       }
-      console.log('[CRYPTO] Deriving shared key…');
+      console.log('[CRYPTO] Deriving shared key…'); dbg('CRYPTO', 'deriving AES key...');
       try {
         const peerPub   = await Crypto.importPublicKey(msg.pub);
         state.sharedKey = await Crypto.deriveSharedKey(state.keyPair, peerPub);
         state.keyReady  = true;
-        console.log('[CRYPTO] AES-256-GCM key ready ✓');
+        console.log('[CRYPTO] AES-256-GCM key ready ✓'); dbg('CRYPTO', 'AES-256-GCM key ready ✓');
         UI.setLockState(true);
         UI.status('🔒 End-to-end encryption active.', 'success');
         if (state.mode === 'send' && state.file) await startTransfer();
       } catch(e) {
-        console.error('[CRYPTO] Key exchange failed:', e);
+        console.error('[CRYPTO] Key exchange failed:', e); dbg('CRYPTO-ERR', e.message||e);
         UI.status(`Key exchange failed: ${e.message}`, 'error');
       }
       break;
@@ -516,7 +548,7 @@ function connectSignaling(joinCode) {
 
     ws.onopen = () => {
       clearTimeout(timeout);
-      console.log('[WS] Connected');
+      console.log('[WS] Connected'); dbg('WS', 'Connected to signaling server');
       if (state.mode === 'send') {
         ws.send(JSON.stringify({ type:'create' }));
       } else {
@@ -527,14 +559,14 @@ function connectSignaling(joinCode) {
     ws.onmessage = async ({ data }) => {
       let msg;
       try { msg = JSON.parse(data); } catch { return; }
-      console.log('[WS] ←', msg.type, msg.code||msg.message||'');
+      console.log('[WS] ←', msg.type, msg.code||msg.message||''); dbg('WS←', msg.type, msg.code||msg.message||'');
 
       switch (msg.type) {
 
         case 'created':
           state.sessionCode = msg.code;
           // Sender is IMPOLITE — it initiates and doesn't yield on collision
-          state.polite = false;
+          state.polite = false; dbg('ROLE', 'IMPOLITE (sender)');
           UI.showCode(msg.code);
           UI.status('Waiting for receiver — share the code or QR…', 'info');
           resolve();
@@ -542,7 +574,7 @@ function connectSignaling(joinCode) {
 
         case 'joined':
           // Receiver is POLITE — it yields if there's a simultaneous offer
-          state.polite = true;
+          state.polite = true; dbg('ROLE', 'POLITE (receiver)');
           UI.status('Joined session — establishing P2P connection…', 'info');
           resolve();
           break;
@@ -551,6 +583,7 @@ function connectSignaling(joinCode) {
         // handle the offer. This is the only place we create the PC.
         case 'peer-joined':
           UI.status('Peer connected — setting up encrypted channel…', 'info');
+          dbg('WS', 'peer-joined → creating PC');
           state.pc = createPeerConnection();
           // onnegotiationneeded fires automatically because of the DC creation
           // inside createPeerConnection(). No manual createOffer() needed.
@@ -572,7 +605,7 @@ function connectSignaling(joinCode) {
             state.pc = createPeerConnection();
           }
           const pc = state.pc;
-          const description = msg.sdp;
+          const description = msg.sdp; dbg('SDP←', description.type, 'sigState='+state.pc?.signalingState);
           const offerCollision = description.type === 'offer' &&
             (state.makingOffer || pc.signalingState !== 'stable');
 
@@ -589,7 +622,7 @@ function connectSignaling(joinCode) {
               ws.send(JSON.stringify({ type:'description', sdp:pc.localDescription }));
             }
           } catch(e) {
-            console.error('[SDP] setRemoteDescription failed:', e);
+            console.error('[SDP] setRemoteDescription failed:', e); dbg('SDP-ERR', e.message||e);
             UI.status(`SDP error: ${e.message}`, 'error');
           }
           break;
@@ -599,10 +632,10 @@ function connectSignaling(joinCode) {
           if (msg.candidate && state.pc) {
             try {
               await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-              console.log('[ICE] Applied');
+              console.log('[ICE] Applied'); dbg('ICE', 'candidate applied');
             } catch(e) {
               // Ignore ICE errors during perfect negotiation offer collisions
-              if (!state.ignoreOffer) console.warn('[ICE] Failed:', e.message);
+              if (!state.ignoreOffer) { console.warn('[ICE] Failed:', e.message); dbg('ICE-WARN', e.message); }
             }
           }
           break;
