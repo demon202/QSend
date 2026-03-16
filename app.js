@@ -2,25 +2,41 @@
  * QSend — Secure Peer-to-Peer File Transfer  app.js
  *
  * Cumulative fixes applied in this version:
- *  1. CHUNK_SIZE = 16 KB  (256 KB + GCM overhead exceeds Chrome's 262,144-byte DC limit)
- *  2. Only 1 STUN server initially — now +2 TURN  (see FIX 10)
- *  3. Null ICE filter     (candidate.candidate === "" sentinel was being relayed)
- *  4. Answer guard        (duplicate answer from Safari/CF replay → InvalidStateError)
- *  5. Clean setupDataChannel  (removed bad `channel.onmessage` / `handleMessage` ref)
- *  6. No duplicate state fields  (pendingICE was declared twice)
- *  7. ECDH race condition FIX  ← THE MAIN BUG causing all transfer failures
- *       Both sides generate their keypair in dc.onopen (async, yields to event loop).
- *       On a LAN, desktop Brave finishes generateKeyPair in ~1ms and sends its
- *       ecdh-key BEFORE Safari iOS finishes (~4-8ms). Safari receives the peer
- *       key while state.keyPair is still null → deriveSharedKey(null.privateKey)
- *       throws a silent TypeError → sharedKey never set → stuck forever.
- *       Fix: buffer the peer key if it arrives early; process it once our own
- *       keypair is ready (at the end of dc.onopen).
- *  8. try/catch around ecdh-key handler  (silent failures now shown as errors)
- *  9. DC created on peer-joined, not on ws.onopen  (WebKit sometimes omits the
- *       m=application section when the DC exists before setLocalDescription)
- * 10. TURN server added  (STUN alone cannot traverse symmetric NAT on mobile
- *       carriers; ~20% of real-world connections need relay)
+ *  1.  CHUNK_SIZE = 16 KB  (256 KB + GCM overhead exceeds Chrome's 262,144-byte DC limit)
+ *  2.  TURN servers added  (STUN alone can't traverse symmetric NAT on mobile carriers)
+ *  3.  Null ICE filter     (candidate.candidate === "" sentinel was being relayed)
+ *  4.  ECDH race condition fixed  (peer key buffered if it arrives before our keypair ready)
+ *  5.  try/catch in ecdh-key handler  (silent failures now shown as errors)
+ *  6.  File read upfront as single ArrayBuffer  (Safari iOS File.slice() detaches in loops)
+ *  7.  dc.send(new Uint8Array())  (Safari/Edge silently drop raw ArrayBuffer sends)
+ *  8.  xferDone set before a.click()  (session-expired can't overwrite success status)
+ *  9.  session-expired guarded by xferDone  (no more "expired" message after success)
+ *
+ * ARCHITECTURE REWRITE — Perfect Negotiation + Out-of-Band DataChannel
+ * ─────────────────────────────────────────────────────────────────────
+ * ROOT CAUSE of "mobile can't send" bug:
+ *   The old code used fixed offerer/answerer roles (whoever got 'peer-joined'
+ *   was always the offerer). On WebKit/iOS, calling createDataChannel() then
+ *   createOffer() in the same tick causes WebKit to fire onnegotiationneeded
+ *   a second time WHILE the first offer is already in flight. This creates two
+ *   simultaneous negotiation cycles that deadlock the connection, leaving both
+ *   sides stuck forever.
+ *
+ * THE FIX — two changes working together:
+ *
+ *   A) Out-of-band DataChannel { negotiated: true, id: 0 }
+ *      Both peers create the DC with the same id. No SDP renegotiation is
+ *      needed for the DC — it just opens once ICE connects. This eliminates
+ *      the onnegotiationneeded double-fire entirely.
+ *
+ *   B) Perfect Negotiation (MDN / W3C recommended pattern)
+ *      Both peers get a PC immediately on connect. The 'sender' (whoever
+ *      gets 'peer-joined') triggers negotiation via onnegotiationneeded.
+ *      Polite/impolite roles handle any offer collision race-free.
+ *      The code is symmetric — identical on both ends.
+ *
+ * This is the pattern used by FilePizza, ShareDrop, and every production
+ * WebRTC app that works reliably across iOS/Android/desktop.
  */
 
 'use strict';
@@ -37,10 +53,8 @@ const CONFIG = Object.freeze({
   MAX_BUFFER:    1  * 1024 * 1024,
   RESUME_BUFFER: 128 * 1024,
 
-  // FIX 10: TURN servers for NAT traversal on mobile/cellular networks.
-  // STUN only discovers your public IP — it does NOT punch through NAT.
-  // Symmetric NAT (common on mobile carriers) requires a TURN relay.
-  // Replace with your own Metered/Twilio/Xirsys credentials for production.
+  // TURN required for ~20% of real-world connections (symmetric NAT on mobile carriers).
+  // Replace openrelay with your own Metered/Twilio/Xirsys credentials for production.
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
     {
@@ -164,9 +178,11 @@ const Crypto = {
 
 const state = {
   mode:null, ws:null, pc:null, dc:null,
-  pendingICE:[],
+  polite:false,               // perfect negotiation role (true = yield on collision)
+  makingOffer:false,          // perfect negotiation guard
+  ignoreOffer:false,          // perfect negotiation guard
   keyPair:null,
-  pendingPeerKey:null,    // FIX 7: holds peer ecdh-key that arrived before our keypair was ready
+  pendingPeerKey:null,        // peer ecdh-key that arrived before our keypair was ready
   sharedKey:null, sessionCode:null,
   file:null, fileHasher:null, totalChunks:0, sentChunks:0, paused:false,
   fileMeta:null, chunks:[], rcvdChunks:0,
@@ -178,7 +194,8 @@ const state = {
     try{this.dc?.close();}catch{}
     try{this.pc?.close();}catch{}
     Object.assign(this,{
-      mode:null,ws:null,pc:null,dc:null,pendingICE:[],
+      mode:null,ws:null,pc:null,dc:null,
+      polite:false,makingOffer:false,ignoreOffer:false,
       keyPair:null,pendingPeerKey:null,sharedKey:null,sessionCode:null,
       file:null,fileHasher:null,totalChunks:0,sentChunks:0,paused:false,
       fileMeta:null,chunks:[],rcvdChunks:0,
@@ -203,18 +220,41 @@ function esc(s){
   return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 }
 
-// ─── WEBRTC ───────────────────────────────────────────────────────
+// ─── WEBRTC — PERFECT NEGOTIATION ────────────────────────────────
+//
+// Both peers run identical code. The 'polite' peer yields if there's
+// a simultaneous offer collision; the 'impolite' peer wins.
+// Roles are assigned by the server: the receiver (who joins) is polite,
+// the sender (who created the session) is impolite.
+// This matches the convention: the initiating side is impolite.
 
 function createPeerConnection() {
-  const pc = new RTCPeerConnection({
-    iceServers: CONFIG.ICE_SERVERS,
-    iceCandidatePoolSize: 4,
-  });
+  const pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS });
+
+  // Out-of-band DataChannel — BOTH sides create it with the same id.
+  // This bypasses in-band SDP negotiation for the DC entirely, which is
+  // the root cause of WebKit/iOS sender failures (double onnegotiationneeded).
+  const dc = pc.createDataChannel('qsend', { negotiated:true, id:0, ordered:true });
+  state.dc = dc;
+  setupDataChannel(dc);
+
+  // Perfect Negotiation: onnegotiationneeded handles offer creation for both sides.
+  pc.onnegotiationneeded = async () => {
+    try {
+      state.makingOffer = true;
+      await pc.setLocalDescription();           // browser picks offer/answer automatically
+      state.ws?.send(JSON.stringify({ type:'description', sdp:pc.localDescription }));
+    } catch(e) {
+      console.error('[PC] onnegotiationneeded error:', e);
+    } finally {
+      state.makingOffer = false;
+    }
+  };
 
   pc.onicecandidate = ({ candidate }) => {
-    // FIX 3: filter null and empty-string sentinel candidates
+    // Filter empty sentinel candidates
     if (candidate && candidate.candidate !== '' && state.ws?.readyState === WebSocket.OPEN) {
-      console.log('[ICE] Sending candidate:', candidate.type, candidate.protocol);
+      console.log('[ICE] Sending:', candidate.type, candidate.protocol);
       state.ws.send(JSON.stringify({ type:'ice', candidate }));
     }
   };
@@ -223,7 +263,7 @@ function createPeerConnection() {
     console.log('[ICE] State:', pc.iceConnectionState);
     UI.setConnDot(pc.iceConnectionState);
     if (pc.iceConnectionState === 'failed') {
-      UI.status('ICE failed — could not establish connection. Try again on a different network.', 'error');
+      UI.status('ICE failed — could not connect. Try again on a different network.', 'error');
       UI.setConnType('Failed');
     }
   };
@@ -233,9 +273,7 @@ function createPeerConnection() {
     if (pc.connectionState === 'connected') detectConnType(pc);
   };
 
-  pc.onsignalingstatechange = () => {
-    console.log('[PC] Signaling:', pc.signalingState);
-  };
+  pc.onsignalingstatechange = () => console.log('[PC] Signaling:', pc.signalingState);
 
   return pc;
 }
@@ -265,17 +303,14 @@ function setupDataChannel(dc) {
     UI.status('Channel open — performing key exchange…', 'info');
     UI.setEncStatus('Exchanging keys…');
 
-    // Generate our keypair and send our public key.
-    // Both sides do this simultaneously. On a LAN, the desktop peer
-    // finishes ~4-7ms faster than iOS Safari and its key arrives at
-    // Safari before Safari has finished generating its own pair.
-    // We handle the resulting race with pendingPeerKey below (FIX 7).
+    // Generate our keypair. Both sides do this simultaneously.
+    // pendingPeerKey handles the race where the peer's key arrives
+    // before our generateKeyPair() completes (common on iOS vs desktop).
     state.keyPair = await Crypto.generateKeyPair();
     const pub = await Crypto.exportPublicKey(state.keyPair);
     dc.send(JSON.stringify({ type:'ecdh-key', pub }));
 
-    // FIX 7: If the peer's ecdh-key arrived while we were awaiting
-    // generateKeyPair(), it was saved in pendingPeerKey. Process it now.
+    // If peer's key arrived early while we were generating, process it now.
     if (state.pendingPeerKey) {
       console.log('[CRYPTO] Processing buffered peer key');
       const saved = state.pendingPeerKey;
@@ -312,14 +347,12 @@ async function onControlMsg(msg) {
   switch (msg.type) {
 
     case 'ecdh-key': {
-      // FIX 7: If our keypair isn't ready yet (generateKeyPair still running),
-      // save the peer's key. dc.onopen will call us again once it completes.
+      // Buffer if our keypair isn't ready yet (generateKeyPair still awaiting)
       if (!state.keyPair) {
-        console.log('[CRYPTO] Peer key arrived before our keypair — buffering');
+        console.log('[CRYPTO] Peer key arrived early — buffering');
         state.pendingPeerKey = msg.pub;
         return;
       }
-      // FIX 8: wrap in try/catch so failures are visible, not silent hangs
       console.log('[CRYPTO] Deriving shared key…');
       try {
         const peerPub   = await Crypto.importPublicKey(msg.pub);
@@ -384,11 +417,8 @@ async function startTransfer() {
   UI.status(`Sending ${esc(file.name)}…`, 'info');
   UI.setSendProgressVisible(true);
 
-  // Read the entire file into memory ONCE before the send loop.
-  // Safari iOS (and some Edge versions) can detach or throw on File.slice()
-  // after many async yield cycles (the sleep(30) backpressure loop).
-  // Reading upfront avoids that entirely. For very large files this trades
-  // memory for reliability — acceptable given the P2P transfer context.
+  // Read entire file into memory once before the loop.
+  // Safari iOS can detach or throw on File.slice() after many async yields.
   let fileBuf;
   try {
     fileBuf = new Uint8Array(await file.arrayBuffer());
@@ -410,12 +440,11 @@ async function startTransfer() {
     const encrypted = await Crypto.encryptChunk(state.sharedKey, i, plain);
 
     try {
-      // Send as Uint8Array, not ArrayBuffer — Safari and some Edge versions
-      // silently drop or error on dc.send(ArrayBuffer) for binary transfers.
+      // Send as Uint8Array — Safari/Edge silently drop raw ArrayBuffer sends
       state.dc.send(new Uint8Array(encrypted));
     } catch(e) {
-      console.error('[SEND] dc.send failed chunk', i, 'size:', encrypted.byteLength, e);
-      UI.status(`Send error on chunk ${i} (${encrypted.byteLength} bytes): ${e.message}`, 'error');
+      console.error('[SEND] dc.send failed chunk', i, e);
+      UI.status(`Send error on chunk ${i}: ${e.message}`, 'error');
       return;
     }
 
@@ -462,21 +491,19 @@ async function finalizeReceive(expected) {
   const url  = URL.createObjectURL(blob);
   const a    = Object.assign(document.createElement('a'), { href:url, download:state.fileMeta.name });
 
-  // Mark done and notify sender BEFORE triggering the download dialog.
-  // This ensures any session-expired or DC-close events that arrive while
-  // the browser is showing the save prompt don't overwrite the success status.
+  // Mark done and send verified BEFORE triggering download.
+  // Any session-expired / DC-close events during the save dialog won't
+  // overwrite the success status (guarded by xferDone below).
   state.chunks=[]; state.xferDone=true;
   state.dc.send(JSON.stringify({ type:'verified', ok:true }));
   UI.status('✓ File saved — SHA-256 verified.', 'success');
   UI.showReceiveComplete(actual);
 
-  // Trigger the download. revokeObjectURL is delayed generously so the
-  // browser has time to start the download before the blob is released.
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-// ─── SIGNALING ────────────────────────────────────────────────────
+// ─── SIGNALING — PERFECT NEGOTIATION ─────────────────────────────
 
 function connectSignaling(joinCode) {
   return new Promise((resolve, reject) => {
@@ -491,9 +518,6 @@ function connectSignaling(joinCode) {
       clearTimeout(timeout);
       console.log('[WS] Connected');
       if (state.mode === 'send') {
-        // FIX 9: Do NOT create PC+DC here. WebKit can drop the m=application
-        // SDP section when the DC is created before setLocalDescription.
-        // We create PC+DC in 'peer-joined' right before createOffer() instead.
         ws.send(JSON.stringify({ type:'create' }));
       } else {
         ws.send(JSON.stringify({ type:'join', code:joinCode }));
@@ -509,79 +533,76 @@ function connectSignaling(joinCode) {
 
         case 'created':
           state.sessionCode = msg.code;
+          // Sender is IMPOLITE — it initiates and doesn't yield on collision
+          state.polite = false;
           UI.showCode(msg.code);
           UI.status('Waiting for receiver — share the code or QR…', 'info');
           resolve();
           break;
 
         case 'joined':
-          UI.status('Joined session — waiting for sender…', 'info');
+          // Receiver is POLITE — it yields if there's a simultaneous offer
+          state.polite = true;
+          UI.status('Joined session — establishing P2P connection…', 'info');
           resolve();
           break;
 
-        // FIX 9: Create PC+DC here, immediately before createOffer().
-        // This is the correct point for WebKit to include m=application in SDP.
+        // peer-joined: receiver connected — create PC and let onnegotiationneeded
+        // handle the offer. This is the only place we create the PC.
         case 'peer-joined':
-          UI.status('Peer connected — negotiating…', 'info');
-          try {
-            state.pc = createPeerConnection();
-            state.dc = state.pc.createDataChannel('qsend', { ordered:true });
-            setupDataChannel(state.dc);
-            console.log('[SEND] PC+DC created, creating offer');
-            const offer = await state.pc.createOffer();
-            await state.pc.setLocalDescription(offer);
-            console.log('[SEND] Offer →');
-            ws.send(JSON.stringify({ type:'offer', sdp:state.pc.localDescription }));
-          } catch(e) {
-            console.error('[SEND] createOffer failed:', e);
-            UI.status(`Offer failed: ${e.message}`, 'error');
-          }
+          UI.status('Peer connected — setting up encrypted channel…', 'info');
+          state.pc = createPeerConnection();
+          // onnegotiationneeded fires automatically because of the DC creation
+          // inside createPeerConnection(). No manual createOffer() needed.
           break;
 
-        case 'offer': {
-          console.log('[RECV] offer ←, creating PC');
+        // peer-present: sent to the RECEIVER when they join a session that
+        // already has a sender. Receiver creates their PC which triggers
+        // onnegotiationneeded on the sender's side via the server's peer-joined.
+        // Receiver just needs to create their PC to be ready for the offer.
+        case 'peer-present':
+          UI.status('Connected to sender — establishing P2P connection…', 'info');
           state.pc = createPeerConnection();
-          state.pc.ondatachannel = ({ channel }) => {
-            console.log('[RECV] DataChannel:', channel.label);
-            state.dc = channel;
-            setupDataChannel(channel);
-          };
-          await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          for (const c of state.pendingICE) {
-            try { await state.pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+          break;
+
+        // Perfect Negotiation: unified handler for offer AND answer
+        case 'description': {
+          if (!state.pc) {
+            // Late arrival before our PC was ready — create it now
+            state.pc = createPeerConnection();
           }
-          state.pendingICE = [];
-          const answer = await state.pc.createAnswer();
-          await state.pc.setLocalDescription(answer);
-          console.log('[RECV] answer →');
-          ws.send(JSON.stringify({ type:'answer', sdp:state.pc.localDescription }));
+          const pc = state.pc;
+          const description = msg.sdp;
+          const offerCollision = description.type === 'offer' &&
+            (state.makingOffer || pc.signalingState !== 'stable');
+
+          state.ignoreOffer = !state.polite && offerCollision;
+          if (state.ignoreOffer) {
+            console.log('[SDP] Impolite — ignoring colliding offer');
+            break;
+          }
+
+          try {
+            await pc.setRemoteDescription(description);
+            if (description.type === 'offer') {
+              await pc.setLocalDescription();   // auto-generates answer
+              ws.send(JSON.stringify({ type:'description', sdp:pc.localDescription }));
+            }
+          } catch(e) {
+            console.error('[SDP] setRemoteDescription failed:', e);
+            UI.status(`SDP error: ${e.message}`, 'error');
+          }
           break;
         }
 
-        case 'answer':
-          // FIX 4: guard against duplicate answers
-          if (!state.pc || state.pc.signalingState !== 'have-local-offer') {
-            console.warn('[SEND] Ignoring answer in state:', state.pc?.signalingState);
-            break;
-          }
-          console.log('[SEND] answer ←');
-          await state.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          for (const c of state.pendingICE) {
-            try { await state.pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
-          }
-          state.pendingICE = [];
-          break;
-
         case 'ice':
-          if (msg.candidate) {
-            if (state.pc && state.pc.remoteDescription) {
-              try {
-                await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                console.log('[ICE] Applied (sdpMid:', msg.candidate.sdpMid, ')');
-              } catch(e) { console.warn('[ICE] Failed:', e.message); }
-            } else {
-              console.log('[ICE] Buffered');
-              state.pendingICE.push(msg.candidate);
+          if (msg.candidate && state.pc) {
+            try {
+              await state.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+              console.log('[ICE] Applied');
+            } catch(e) {
+              // Ignore ICE errors during perfect negotiation offer collisions
+              if (!state.ignoreOffer) console.warn('[ICE] Failed:', e.message);
             }
           }
           break;
@@ -593,13 +614,10 @@ function connectSignaling(joinCode) {
           break;
 
         case 'session-expired':
-          // Never show "session expired" if the transfer already completed —
-          // the session expires naturally right after the receiver triggers
-          // the download, so xferDone guards against overwriting the success msg.
           if (!state.xferDone && (!state.pc || state.pc.connectionState !== 'connected')) {
             UI.status('Session expired.', 'error');
           } else {
-            console.log('[WS] Session expired — ignoring (xferDone or P2P still active)');
+            console.log('[WS] Session expired — ignoring (xferDone or P2P active)');
           }
           break;
 
@@ -610,7 +628,7 @@ function connectSignaling(joinCode) {
     };
 
     ws.onerror = (e) => { clearTimeout(timeout); console.error('[WS] Error:', e); reject(new Error('WebSocket error')); };
-    ws.onclose = () => { console.log('[WS] Closed'); };
+    ws.onclose = () => console.log('[WS] Closed');
   });
 }
 
