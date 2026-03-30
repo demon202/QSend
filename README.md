@@ -1,6 +1,6 @@
 # QSend: A Secure Peer-to-Peer File Transfer App
 
-> Encrypted browser-to-browser file transfer. Files never touch any server.
+Vibe Coding > Encrypted browser-to-browser file transfer. Files never touch any server.
 
 [![Deploy Frontend](https://img.shields.io/badge/frontend-GitHub%20Pages-181717?logo=github)](https://pages.github.com)
 [![Deploy Server](https://img.shields.io/badge/server-Fly.io-8B5CF6?logo=fly)](https://fly.io)
