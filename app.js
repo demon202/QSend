@@ -60,6 +60,7 @@ const CONFIG = Object.freeze({
   // Replace openrelay with your own Metered/Twilio/Xirsys credentials for production.
   ICE_SERVERS: [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
     {
       urls:       'turn:openrelay.metered.ca:80',
       username:   'openrelayproject',
@@ -67,6 +68,11 @@ const CONFIG = Object.freeze({
     },
     {
       urls:       'turn:openrelay.metered.ca:443',
+      username:   'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls:       'turn:openrelay.metered.ca:443?transport=tcp',
       username:   'openrelayproject',
       credential: 'openrelayproject',
     },
@@ -515,6 +521,18 @@ async function finalizeReceive(expected) {
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
+// ─── SDP SANITIZER ────────────────────────────────────────────────
+// Safari iOS < 15.1 throws a hard error on setRemoteDescription() when the
+// SDP contains "a=extmap-allow-mixed". Chrome/Brave always include this line.
+// This is the primary reason Safari iOS fails in BOTH roles:
+//   As receiver: Brave's offer has the line → Safari throws → answer never sent
+//   As sender:   Brave's answer has the line → Safari throws → ICE never starts
+// Chrome iOS (WKWebView) handles it correctly — why Chrome iOS works but Safari doesn't.
+// Fix: strip the line from every remote SDP before calling setRemoteDescription.
+function sanitizeSDP(sdp) {
+  return sdp.split('\r\n').filter(l => l !== 'a=extmap-allow-mixed').join('\r\n');
+}
+
 // ─── SIGNALING — PERFECT NEGOTIATION ─────────────────────────────
 
 function connectSignaling(joinCode) {
@@ -614,7 +632,10 @@ function connectSignaling(joinCode) {
           }
 
           try {
-            await pc.setRemoteDescription(description);
+            // Sanitize first — strip a=extmap-allow-mixed for Safari iOS compat
+            await pc.setRemoteDescription(
+              new RTCSessionDescription({ type: description.type, sdp: sanitizeSDP(description.sdp) })
+            );
             if (description.type === 'offer') {
               // Explicit createAnswer() for Safari compatibility (same reason as createOffer above)
               const answer = await pc.createAnswer();
