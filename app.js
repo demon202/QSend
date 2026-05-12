@@ -47,9 +47,12 @@ const CONFIG = Object.freeze({
   // ← REPLACE THIS with your Railway/Render URL after deploying server/index.js
   // e.g. 'wss://qsend-signal-production.up.railway.app'
   // For local testing: set to 'ws://localhost:8080'
+  // ← Your Cloudflare Worker URL. Format: wss://<name>.<account>.workers.dev
+  // Find it in the Cloudflare dashboard after deploying, or run: wrangler deploy
+  // For local testing it auto-switches to ws://localhost:8080
   SIGNAL_URL: (() => {
     const local = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-    return local ? 'ws://localhost:8080' : 'wss://YOUR-RAILWAY-APP.up.railway.app';
+    return local ? 'ws://localhost:8080' : 'wss://qsend-signal.qsend-test.workers.dev';
   })(),
 
   CHUNK_SIZE:    16 * 1024,
