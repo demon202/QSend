@@ -153,41 +153,17 @@ function handleMessage(ws, msg) {
       break;
     }
 
-    // ── WebRTC SDP offer (sender → receiver) ────────────────────
-    case 'offer': {
-      if (!validateInSession(ws)) return;
-      if (ws.role !== 'sender') {
-        safeSend(ws, { type: 'error', message: 'Only sender sends offer' });
-        return;
-      }
-      const session = sessions.get(ws.sessionCode);
-      if (!session?.receiver) {
-        safeSend(ws, { type: 'error', message: 'No receiver yet' });
-        return;
-      }
-      // Relay verbatim — server never inspects SDP content
-      relay(session.receiver, { type: 'offer', sdp: msg.sdp });
-      break;
-    }
-
-    // ── WebRTC SDP answer (receiver → sender) ───────────────────
-    case 'answer': {
-      if (!validateInSession(ws)) return;
-      if (ws.role !== 'receiver') {
-        safeSend(ws, { type: 'error', message: 'Only receiver sends answer' });
-        return;
-      }
-      const session = sessions.get(ws.sessionCode);
-      relay(session?.sender, { type: 'answer', sdp: msg.sdp });
-      break;
-    }
-
-    // ── ICE candidates (bidirectional) ──────────────────────────
+    // ── WebRTC relay — bidirectional, no role restriction ───────
+    // 'description' = unified offer+answer (perfect negotiation pattern)
+    // 'offer'/'answer'/'ice' kept as aliases for compatibility
+    case 'description':
+    case 'offer':
+    case 'answer':
     case 'ice': {
       if (!validateInSession(ws)) return;
       const session = sessions.get(ws.sessionCode);
       const peer = ws.role === 'sender' ? session?.receiver : session?.sender;
-      relay(peer, { type: 'ice', candidate: msg.candidate });
+      relay(peer, msg);   // relay the full message object verbatim
       break;
     }
 

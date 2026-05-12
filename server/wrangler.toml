@@ -1,13 +1,11 @@
 name = "qsend-signal"
-main = "cloudflare.worker.js"
+main = "cloudflare_worker.js"
 compatibility_date = "2024-09-23"
 
 [[durable_objects.bindings]]
 name = "SESSIONS"
 class_name = "SessionStore"
 
-# Use new_classes (not new_sqlite_classes) — we use the standard KV storage API,
-# not SQLite. new_sqlite_classes is a paid/beta feature and was causing deploy errors.
 [[migrations]]
 tag = "v1"
 new_classes = ["SessionStore"]
